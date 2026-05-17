@@ -28,7 +28,7 @@ hub-cli config show        # show current configuration
 hub-cli config set-theme   # change the interface theme
 ```
 
-See [docs/Instructions.md](docs/Instructions.md) for the full command reference and configuration details.
+Ask for/See [docs/Instructions.md](docs/Instructions.md) for the full command reference and configuration details.
 
 ---
 
@@ -62,4 +62,4 @@ hub-cli config show        # mostra la configurazione corrente
 hub-cli config set-theme   # cambia tema dell'interfaccia
 ```
 
-Vedi [docs/Instructions.md](docs/Instructions.md) per il riferimento completo dei comandi e la configurazione.
+Chiedi/Vedi [docs/Instructions.md](docs/Instructions.md) per il riferimento completo dei comandi e la configurazione.
