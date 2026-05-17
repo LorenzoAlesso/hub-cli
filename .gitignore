@@ -1,0 +1,50 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+hub-cli
+
+# Test binary
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Config files with secrets
+.hub-cli.yaml
+*.yaml.local
+
+# Seed locale (dati specifici ambiente, non committare — solo il template seed.example.yaml è versionato)
+seed.yaml
+*.seed.yaml
+
+# File deprecato (PSN — codice commentato, contiene riferimenti specifici ambiente)
+cmd/psn.go
+
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+#Docs
+docs/*
+docs/TODO.md
+
+#Claude
+/.claude/settings.local.json
+/internal/logic/azure.go

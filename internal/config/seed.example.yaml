@@ -1,0 +1,58 @@
+# Template seed.yaml per hub-cli.
+#
+# Uso:
+#   1. Copia questo file in ~/.hub-cli.seed.yaml
+#   2. Personalizza i valori per i tuoi servizi
+#   3. Rilancia un qualsiasi comando hub-cli per importarli nel config utente
+#
+# NOTA: il file ~/.hub-cli.seed.yaml NON va committato — contiene dati
+# specifici dell'ambiente (registry, namespace, release name, ecc.).
+#
+# Formato: stessa struttura della sezione `services` di ~/.hub-cli.yaml.
+# Ogni servizio ha campi obbligatori (ecr_repository, helm_set_key)
+# e campi opzionali documentati di seguito.
+
+services:
+  my-service:
+    # Tag iniziale che verrà mostrato come "ultimo deploy"
+    last_tag: 1.0.0-dev
+
+    # Path relativo al docker_root_path del Dockerfile del servizio
+    dockerfile_subpath: my-service/Dockerfile
+
+    # Path relativo all'helm_root_path del file values usato per il deploy
+    helm_values_path: env/values-dev.yaml
+
+    # Namespace Kubernetes target
+    namespace: my-namespace
+
+    # Chart Helm da installare (formato: repo/chart)
+    chart_name: my-charts/my-app
+    chart_version: 0.1.0
+
+    # Nome della release Helm
+    release_name: my-app-dev
+
+    # URI ECR completo dell'immagine (registry + repository)
+    ecr_repository: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/my-org/my-service
+
+    # Chiave dot-notation nel values.yaml dove scrivere il nuovo tag.
+    # Due forme supportate:
+    #   - "<path>.tag"   → scrive solo il tag (es. webapp.image.tag)
+    #   - "<path>.image" → scrive l'immagine intera "<helm_image_path>:<tag>"
+    helm_set_key: myService.image.tag
+
+    # ── Campi opzionali ─────────────────────────────────────────────────
+    # Da usare solo se la struttura del chart o del manifest lo richiede.
+
+    # Prefisso immagine quando helm_set_key punta a "<path>.image":
+    # il valore scritto sarà "<helm_image_path>:<tag>".
+    # helm_image_path: my-org/my-service
+
+    # Path del manifest Kubernetes da aggiornare oltre ai values Helm
+    # (usato per commit post-deploy sul repo k8s).
+    # k8s_manifest_path: k8s/my-service-deployment.yaml
+
+    # Stringa da cercare nel manifest k8s per individuare l'immagine
+    # da aggiornare (tipicamente "<org>/<service>").
+    # k8s_image_ref: my-org/my-service
