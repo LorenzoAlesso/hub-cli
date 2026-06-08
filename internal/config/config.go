@@ -77,10 +77,7 @@ func Init(customPath string) error {
 		viper.SetConfigFile(filepath.Join(home, ".hub-cli.yaml"))
 	}
 
-	// Generic defaults only; environment-specific values (ECR account, chart
-	// version) come from the seed file's `config` block or per-service config.
 	viper.SetDefault("config.ecr_region", "eu-west-1")
-	viper.SetDefault("config.local_kube_context", "kubernetes-admin@kubernetes")
 
 	if err := viper.ReadInConfig(); err != nil {
 		loaded, seedErr := seedDefaultServices()

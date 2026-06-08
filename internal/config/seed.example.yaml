@@ -26,6 +26,10 @@ config:
   # chart_version. Consigliato impostarla per-servizio anziché qui.
   # chart_version: 0.1.0
 
+  # Contesto kubectl del cluster locale. Se assente, al primo deploy/refresh
+  # viene chiesto interattivamente. Impostalo qui per saltare il prompt.
+  # local_kube_context: kubernetes-admin@kubernetes
+
 services:
   my-service:
     # Tag iniziale che verrà mostrato come "ultimo deploy"
