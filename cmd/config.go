@@ -251,6 +251,11 @@ func addServiceGuided(cfg *config.Config, prevErr error) error {
 		return errCancelled
 	}
 
+	chartVersion, cancelled := ui.RunInput("Chart version (es. 0.4.0)", "", "")
+	if cancelled {
+		return errCancelled
+	}
+
 	releaseName, cancelled := ui.RunInput("Release name (es. my-app-dev)", "", "")
 	if cancelled {
 		return errCancelled
@@ -286,6 +291,7 @@ func addServiceGuided(cfg *config.Config, prevErr error) error {
 		HelmValuesPath:    helmValuesPath,
 		Namespace:         namespace,
 		ChartName:         chartName,
+		ChartVersion:      chartVersion,
 		ReleaseName:       releaseName,
 		ECRRepository:     ecrRepo,
 		HelmSetKey:        helmSetKey,
@@ -360,11 +366,17 @@ var configRemoveServiceCmd = &cobra.Command{
 }
 
 var configRefreshCmd = &cobra.Command{
-	Use:   "refresh",
-	Short: "Sincronizza i last_tag con i tag deployati sul cluster",
+	Use:          "refresh",
+	Short:        "Sincronizza i last_tag con i tag deployati sul cluster",
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load()
 		if err != nil {
+			return err
+		}
+
+		// Read from the local cluster, not whatever context happens to be active.
+		if err := ensureLocalKubeContext(cfg); err != nil {
 			return err
 		}
 
@@ -477,6 +489,63 @@ var configRefreshCmd = &cobra.Command{
 	},
 }
 
+var configSetChartCmd = &cobra.Command{
+	Use:          "set-chart <versione> [servizio...]",
+	Short:        "Imposta la chart version su uno o più servizi",
+	Args:         cobra.MinimumNArgs(1),
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		version := strings.TrimSpace(args[0])
+		if version == "" {
+			return fmt.Errorf("versione obbligatoria")
+		}
+
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		if len(cfg.Services) == 0 {
+			ui.PrintWarn("Nessun servizio configurato.")
+			return nil
+		}
+
+		var targets []string
+		if len(args) > 1 {
+			// Explicit service list: validate against config (viper keys are lowercased).
+			for _, name := range args[1:] {
+				name = strings.ToLower(name)
+				if _, ok := cfg.Services[name]; !ok {
+					return fmt.Errorf("servizio %q non trovato", name)
+				}
+				targets = append(targets, name)
+			}
+		} else {
+			names := sortedKeys(cfg.Services)
+			items := make([]ui.Item, len(names))
+			for i, n := range names {
+				cur := cfg.Services[n].ChartVersion
+				if cur == "" {
+					cur = "(usa globale)"
+				}
+				items[i] = ui.Item{Value: n, Label: n, Desc: "attuale: " + cur}
+			}
+			selected, cancelled := ui.RunMultiSelect(
+				fmt.Sprintf("Servizi a cui impostare chart %s", version), items)
+			if cancelled {
+				return errCancelled
+			}
+			targets = selected
+		}
+
+		if err := config.SetChartVersionForServices(version, targets); err != nil {
+			return fmt.Errorf("errore salvataggio chart version: %w", err)
+		}
+
+		ui.PrintOK(fmt.Sprintf("Chart version %q impostata su %d servizi.", version, len(targets)))
+		return nil
+	},
+}
+
 var configSetThemeCmd = &cobra.Command{
 	Use:   "set-theme",
 	Short: "Cambia il tema dell'interfaccia",
@@ -500,6 +569,7 @@ func init() {
 	configCmd.AddCommand(configAddServiceCmd)
 	configCmd.AddCommand(configRemoveServiceCmd)
 	configCmd.AddCommand(configRefreshCmd)
+	configCmd.AddCommand(configSetChartCmd)
 	configCmd.AddCommand(configSetThemeCmd)
 }
 

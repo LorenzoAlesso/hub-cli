@@ -8,9 +8,23 @@
 # NOTA: il file ~/.hub-cli.seed.yaml NON va committato — contiene dati
 # specifici dell'ambiente (registry, namespace, release name, ecc.).
 #
-# Formato: stessa struttura della sezione `services` di ~/.hub-cli.yaml.
+# Formato: stessa struttura di ~/.hub-cli.yaml (sezioni `config` e `services`).
 # Ogni servizio ha campi obbligatori (ecr_repository, helm_set_key)
 # e campi opzionali documentati di seguito.
+
+# ── Configurazione globale (opzionale) ──────────────────────────────────
+# Applicata solo al primo avvio, quando ~/.hub-cli.yaml non esiste ancora.
+# Se una chiave è assente, vale il default interno.
+config:
+  # Account ID AWS del registry ECR (12 cifre)
+  ecr_account_id: "000000000000"
+
+  # Regione AWS del registry ECR
+  ecr_region: eu-west-1
+
+  # Versione chart di fallback, usata solo se un servizio non ha la sua
+  # chart_version. Consigliato impostarla per-servizio anziché qui.
+  # chart_version: 0.1.0
 
 services:
   my-service:

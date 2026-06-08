@@ -77,9 +77,9 @@ func Init(customPath string) error {
 		viper.SetConfigFile(filepath.Join(home, ".hub-cli.yaml"))
 	}
 
+	// Generic defaults only; environment-specific values (ECR account, chart
+	// version) come from the seed file's `config` block or per-service config.
 	viper.SetDefault("config.ecr_region", "eu-west-1")
-	viper.SetDefault("config.ecr_account_id", "000000000000")
-	viper.SetDefault("config.chart_version", "3.0.0")
 	viper.SetDefault("config.local_kube_context", "kubernetes-admin@kubernetes")
 
 	if err := viper.ReadInConfig(); err != nil {
@@ -122,9 +122,14 @@ func Init(customPath string) error {
 	return nil
 }
 
-// loadSeedFromFile reads ~/.hub-cli.seed.yaml and returns the services map.
-// Missing file is a valid state and returns (nil, nil); a malformed file returns an error.
-func loadSeedFromFile() (map[string]map[string]any, error) {
+type seedFile struct {
+	Config   map[string]any            `yaml:"config"`
+	Services map[string]map[string]any `yaml:"services"`
+}
+
+// loadSeedFromFile reads ~/.hub-cli.seed.yaml. Missing file is a valid state
+// and returns (nil, nil); a malformed file returns an error.
+func loadSeedFromFile() (*seedFile, error) {
 	path := SeedFilePath()
 	if path == "" {
 		return nil, nil
@@ -136,31 +141,33 @@ func loadSeedFromFile() (map[string]map[string]any, error) {
 		}
 		return nil, fmt.Errorf("errore lettura seed file %s: %w", path, err)
 	}
-	var parsed struct {
-		Services map[string]map[string]any `yaml:"services"`
-	}
+	var parsed seedFile
 	if err := yaml.Unmarshal(data, &parsed); err != nil {
 		return nil, fmt.Errorf("errore parsing seed file %s: %w", path, err)
 	}
-	return parsed.Services, nil
+	return &parsed, nil
 }
 
-// seedDefaultServices populates viper with services from the seed file.
-// Returns (true, nil) if at least one service was loaded.
+// seedDefaultServices populates viper from the seed file on first run, applying
+// both the global `config` block and the services. Returns (true, nil) if at
+// least one service was loaded.
 func seedDefaultServices() (bool, error) {
-	services, err := loadSeedFromFile()
+	seed, err := loadSeedFromFile()
 	if err != nil {
 		return false, err
 	}
-	if len(services) == 0 {
+	if seed == nil {
 		return false, nil
 	}
-	for name, fields := range services {
+	for key, val := range seed.Config {
+		viper.Set(fmt.Sprintf("config.%s", key), val)
+	}
+	for name, fields := range seed.Services {
 		for key, val := range fields {
 			viper.Set(fmt.Sprintf("services.%s.%s", name, key), val)
 		}
 	}
-	return true, nil
+	return len(seed.Services) > 0, nil
 }
 
 // sanitizeServiceKeysInFile strips service keys containing control characters
@@ -222,16 +229,16 @@ func sanitizeServiceKeysInFile() bool {
 // ensureMissingSeedServices adds seed-file services that are not yet in the config.
 // Returns (true, nil) if any service was added.
 func ensureMissingSeedServices() (bool, error) {
-	services, err := loadSeedFromFile()
+	seed, err := loadSeedFromFile()
 	if err != nil {
 		return false, err
 	}
-	if len(services) == 0 {
+	if seed == nil || len(seed.Services) == 0 {
 		return false, nil
 	}
 	current := viper.GetStringMap("services")
 	added := false
-	for name, fields := range services {
+	for name, fields := range seed.Services {
 		if _, exists := current[strings.ToLower(name)]; exists {
 			continue
 		}
@@ -289,6 +296,14 @@ func SetHelmRootPath(path string) error {
 
 func UpdateServiceChartVersion(serviceName, chartVersion string) error {
 	viper.Set(fmt.Sprintf("services.%s.chart_version", serviceName), chartVersion)
+	return Save()
+}
+
+// SetChartVersionForServices sets chart_version on the named services.
+func SetChartVersionForServices(chartVersion string, names []string) error {
+	for _, name := range names {
+		viper.Set(fmt.Sprintf("services.%s.chart_version", name), chartVersion)
+	}
 	return Save()
 }
 
