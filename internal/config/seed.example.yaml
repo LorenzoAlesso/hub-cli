@@ -99,3 +99,18 @@ services:
 #   # mapping ricadono sulla ricerca automatica dei Dockerfile.
 #   deployments:
 #     webapp: my-service
+#
+#   # Progetti Docker dedicati per-namespace (opzionale): nei namespace che
+#   # matchano il pattern, i Dockerfile si risolvono dentro docker_root
+#   # (mapping esplicito → convenzione <deployment>/Dockerfile → scansione)
+#   # invece che nel docker_root_path globale. branch_coll/branch_prod:
+#   # branch git su cui il repo deve trovarsi per quell'ambiente — verificato
+#   # prima della build, con proposta di checkout (bloccato se il repo ha
+#   # modifiche non committate).
+#   projects:
+#     - namespace: "legacy-*"
+#       docker_root: C:/dev/legacy-project/docker-images
+#       branch_coll: develop
+#       branch_prod: main
+#       deployments:
+#         api: api/custom/Dockerfile   # override del path convenzionale

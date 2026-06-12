@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -78,6 +79,29 @@ func (c PSNClusterConfig) IsProd() bool {
 	return env == "prod" || env == "produzione" || env == "production"
 }
 
+// PSNProjectConfig overrides Dockerfile resolution for the namespaces matching
+// Namespace (glob, e.g. "pcs-*"): builds use DockerRoot instead of the global
+// docker_root_path. BranchColl/BranchProd are the git branches DockerRoot is
+// expected to be on for collaudo/produzione clusters — when set, the workflow
+// verifies the branch (offering a checkout) before building, because the
+// branch determines what gets baked into the images.
+type PSNProjectConfig struct {
+	Namespace   string            `mapstructure:"namespace"   yaml:"namespace"`
+	DockerRoot  string            `mapstructure:"docker_root" yaml:"docker_root"`
+	BranchColl  string            `mapstructure:"branch_coll" yaml:"branch_coll"`
+	BranchProd  string            `mapstructure:"branch_prod" yaml:"branch_prod"`
+	Deployments map[string]string `mapstructure:"deployments" yaml:"deployments"` // deployment → Dockerfile path relative to docker_root
+}
+
+// ExpectedBranch returns the git branch DockerRoot should be on for the given
+// cluster, or "" when no branch constraint applies.
+func (p PSNProjectConfig) ExpectedBranch(cluster PSNClusterConfig) string {
+	if cluster.IsProd() {
+		return p.BranchProd
+	}
+	return p.BranchColl
+}
+
 // PSNConfig is the PSN (Azure) deploy configuration: target clusters plus the
 // deployment → local service mapping used to resolve Dockerfiles for builds.
 // Namespaces, deployments, ACR repository paths and current tags are all
@@ -86,6 +110,24 @@ type PSNConfig struct {
 	TenantID    string             `mapstructure:"tenant_id"`
 	Clusters    []PSNClusterConfig `mapstructure:"clusters"`
 	Deployments map[string]string  `mapstructure:"deployments"`
+	Projects    []PSNProjectConfig `mapstructure:"projects"`
+}
+
+// ProjectForNamespace returns the first project whose pattern matches ns,
+// or nil when the namespace uses the default resolution.
+func (p PSNConfig) ProjectForNamespace(ns string) *PSNProjectConfig {
+	for i, proj := range p.Projects {
+		if proj.Namespace == "" {
+			continue
+		}
+		if ok, err := path.Match(proj.Namespace, ns); err == nil && ok {
+			return &p.Projects[i]
+		}
+		if proj.Namespace == ns {
+			return &p.Projects[i]
+		}
+	}
+	return nil
 }
 
 // Validate checks that the PSN block is present and complete enough to run a deploy.
@@ -239,8 +281,10 @@ func seedDefaultServices() (bool, error) {
 	return len(seed.Services) > 0, nil
 }
 
-// ensureMissingPSNBlock imports the seed's psn block when the config has none.
-// An existing psn block is never touched. Returns (true, nil) if imported.
+// ensureMissingPSNBlock imports the seed's psn block when the config has none,
+// and fills in any top-level psn key (tenant_id, clusters, deployments,
+// projects, ...) the config is still missing. Existing keys are never touched.
+// Returns (true, nil) if anything was imported.
 func ensureMissingPSNBlock() (bool, error) {
 	seed, err := loadSeedFromFile()
 	if err != nil {
@@ -249,11 +293,18 @@ func ensureMissingPSNBlock() (bool, error) {
 	if seed == nil || len(seed.PSN) == 0 {
 		return false, nil
 	}
-	if viper.IsSet("psn") {
-		return false, nil
+	if !viper.IsSet("psn") {
+		viper.Set("psn", seed.PSN)
+		return true, nil
 	}
-	viper.Set("psn", seed.PSN)
-	return true, nil
+	added := false
+	for key, val := range seed.PSN {
+		if !viper.IsSet("psn." + key) {
+			viper.Set("psn."+key, val)
+			added = true
+		}
+	}
+	return added, nil
 }
 
 // sanitizeServiceKeysInFile strips service keys containing control characters
