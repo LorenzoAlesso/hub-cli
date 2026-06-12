@@ -61,9 +61,73 @@ type ServiceConfig struct {
 	K8sImageRef       string `mapstructure:"k8s_image_ref"      yaml:"k8s_image_ref,omitempty"`
 }
 
+// PSNClusterConfig identifies one PSN target environment
+// (Azure subscription + AKS cluster + ACR registry).
+type PSNClusterConfig struct {
+	Name           string `mapstructure:"name"            yaml:"name"`
+	SubscriptionID string `mapstructure:"subscription_id" yaml:"subscription_id"`
+	ResourceGroup  string `mapstructure:"resource_group"  yaml:"resource_group"`
+	AKSName        string `mapstructure:"aks_name"        yaml:"aks_name"`
+	ACRName        string `mapstructure:"acr_name"        yaml:"acr_name"`
+	Env            string `mapstructure:"env"             yaml:"env"` // coll | prod
+}
+
+// IsProd reports whether the cluster is a production environment.
+func (c PSNClusterConfig) IsProd() bool {
+	env := strings.ToLower(strings.TrimSpace(c.Env))
+	return env == "prod" || env == "produzione" || env == "production"
+}
+
+// PSNConfig is the PSN (Azure) deploy configuration: target clusters plus the
+// deployment → local service mapping used to resolve Dockerfiles for builds.
+// Namespaces, deployments, ACR repository paths and current tags are all
+// discovered live from the selected cluster, so they are not configured here.
+type PSNConfig struct {
+	TenantID    string             `mapstructure:"tenant_id"`
+	Clusters    []PSNClusterConfig `mapstructure:"clusters"`
+	Deployments map[string]string  `mapstructure:"deployments"`
+}
+
+// Validate checks that the PSN block is present and complete enough to run a deploy.
+func (p PSNConfig) Validate() error {
+	if len(p.Clusters) == 0 {
+		return fmt.Errorf("nessun cluster nel blocco psn")
+	}
+	if p.TenantID == "" {
+		return fmt.Errorf("tenant_id mancante nel blocco psn")
+	}
+	for i, c := range p.Clusters {
+		var missing []string
+		if c.Name == "" {
+			missing = append(missing, "name")
+		}
+		if c.SubscriptionID == "" {
+			missing = append(missing, "subscription_id")
+		}
+		if c.ResourceGroup == "" {
+			missing = append(missing, "resource_group")
+		}
+		if c.AKSName == "" {
+			missing = append(missing, "aks_name")
+		}
+		if c.ACRName == "" {
+			missing = append(missing, "acr_name")
+		}
+		if len(missing) > 0 {
+			label := c.Name
+			if label == "" {
+				label = fmt.Sprintf("#%d", i+1)
+			}
+			return fmt.Errorf("cluster %s: campi mancanti: %s", label, strings.Join(missing, ", "))
+		}
+	}
+	return nil
+}
+
 type Config struct {
 	Config   GlobalConfig             `mapstructure:"config"`
 	Services map[string]ServiceConfig `mapstructure:"services"`
+	PSN      PSNConfig                `mapstructure:"psn"`
 }
 
 func Init(customPath string) error {
@@ -110,7 +174,11 @@ func Init(customPath string) error {
 	if err != nil {
 		return err
 	}
-	if added {
+	psnAdded, err := ensureMissingPSNBlock()
+	if err != nil {
+		return err
+	}
+	if added || psnAdded {
 		if err := viper.WriteConfig(); err != nil {
 			return err
 		}
@@ -122,6 +190,7 @@ func Init(customPath string) error {
 type seedFile struct {
 	Config   map[string]any            `yaml:"config"`
 	Services map[string]map[string]any `yaml:"services"`
+	PSN      map[string]any            `yaml:"psn"`
 }
 
 // loadSeedFromFile reads ~/.hub-cli.seed.yaml. Missing file is a valid state
@@ -164,7 +233,27 @@ func seedDefaultServices() (bool, error) {
 			viper.Set(fmt.Sprintf("services.%s.%s", name, key), val)
 		}
 	}
+	if len(seed.PSN) > 0 {
+		viper.Set("psn", seed.PSN)
+	}
 	return len(seed.Services) > 0, nil
+}
+
+// ensureMissingPSNBlock imports the seed's psn block when the config has none.
+// An existing psn block is never touched. Returns (true, nil) if imported.
+func ensureMissingPSNBlock() (bool, error) {
+	seed, err := loadSeedFromFile()
+	if err != nil {
+		return false, err
+	}
+	if seed == nil || len(seed.PSN) == 0 {
+		return false, nil
+	}
+	if viper.IsSet("psn") {
+		return false, nil
+	}
+	viper.Set("psn", seed.PSN)
+	return true, nil
 }
 
 // sanitizeServiceKeysInFile strips service keys containing control characters

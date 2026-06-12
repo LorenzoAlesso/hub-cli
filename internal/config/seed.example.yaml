@@ -74,3 +74,28 @@ services:
     # Stringa da cercare nel manifest k8s per individuare l'immagine
     # da aggiornare (tipicamente "<org>/<service>").
     # k8s_image_ref: my-org/my-service
+
+# ── Deploy PSN (Azure AKS + ACR) — opzionale ────────────────────────────
+# Configurazione per `hub-cli psn`. Namespace, deployment, repository ACR e
+# tag correnti vengono scoperti live dal cluster selezionato: qui servono
+# solo i cluster target e il mapping deployment → servizio locale (usato per
+# risolvere Dockerfile e build args della build).
+# psn:
+#   # Tenant Azure (richiesto da `az login`)
+#   tenant_id: "00000000-0000-0000-0000-000000000000"
+#
+#   # Un cluster per ambiente. env: coll | prod — gli ambienti prod
+#   # richiedono una conferma extra (digitazione del nome) prima del deploy.
+#   clusters:
+#     - name: "MYENV — Collaudo"
+#       subscription_id: "00000000-0000-0000-0000-000000000000"
+#       resource_group: RG-My-Env-AKS
+#       aks_name: myaksname001
+#       acr_name: myacrname001
+#       env: coll
+#
+#   # Mapping deployment (nome sul cluster PSN) → servizio locale: la build
+#   # riusa dockerfile_subpath del servizio indicato. I deployment senza
+#   # mapping ricadono sulla ricerca automatica dei Dockerfile.
+#   deployments:
+#     webapp: my-service

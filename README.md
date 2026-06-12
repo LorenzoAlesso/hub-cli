@@ -23,7 +23,9 @@ On first run, the config file is created at `~/.hub-cli.yaml`.
 ## Quick start
 
 ```
-hub-cli                    # run the deploy workflow
+hub-cli                    # pick the environment (Local / PSN) and run the deploy workflow
+hub-cli local              # deploy to the local cluster (ECR + Helm)
+hub-cli psn                # deploy to PSN environments (Azure AKS + ACR)
 hub-cli config show        # show current configuration
 hub-cli config set-theme   # change the interface theme
 ```
@@ -57,7 +59,9 @@ Al primo avvio il file di configurazione viene creato automaticamente in `~/.hub
 ## Utilizzo rapido
 
 ```
-hub-cli                    # avvia il workflow di deploy
+hub-cli                    # scegli l'ambiente (Locale / PSN) e avvia il workflow di deploy
+hub-cli local              # deploy sul cluster locale (ECR + Helm)
+hub-cli psn                # deploy sugli ambienti PSN (Azure AKS + ACR)
 hub-cli config show        # mostra la configurazione corrente
 hub-cli config set-theme   # cambia tema dell'interfaccia
 ```

@@ -112,37 +112,48 @@ func sortedKeys(m map[string]config.ServiceConfig) []string {
 }
 
 func ensureRootPaths(cfg *config.Config) error {
-	changed := false
-	if cfg.Config.DockerRootPath == "" {
-		ui.PrintWarn("Percorso base Docker non configurato.")
-		path, cancelled := ui.RunInput("Percorso base progetti Docker", "", "")
-		if cancelled {
-			return errCancelled
-		}
-		if path == "" {
-			return fmt.Errorf("percorso Docker obbligatorio")
-		}
-		if err := config.SetDockerRootPath(path); err != nil {
-			return fmt.Errorf("errore salvataggio docker root: %w", err)
-		}
-		changed = true
+	if err := ensureDockerRoot(cfg); err != nil {
+		return err
 	}
-	if cfg.Config.HelmRootPath == "" {
-		ui.PrintWarn("Percorso base Helm non configurato.")
-		path, cancelled := ui.RunInput("Percorso base charts Helm", "", "")
-		if cancelled {
-			return errCancelled
-		}
-		if path == "" {
-			return fmt.Errorf("percorso Helm obbligatorio")
-		}
-		if err := config.SetHelmRootPath(path); err != nil {
-			return fmt.Errorf("errore salvataggio helm root: %w", err)
-		}
-		changed = true
+	return ensureHelmRoot(cfg)
+}
+
+func ensureDockerRoot(cfg *config.Config) error {
+	if cfg.Config.DockerRootPath != "" {
+		return nil
 	}
-	if changed {
-		ui.PrintOK(fmt.Sprintf("Percorsi salvati in %s", config.GetFilePath()))
+	ui.PrintWarn("Percorso base Docker non configurato.")
+	path, cancelled := ui.RunInput("Percorso base progetti Docker", "", "")
+	if cancelled {
+		return errCancelled
 	}
+	if path == "" {
+		return fmt.Errorf("percorso Docker obbligatorio")
+	}
+	if err := config.SetDockerRootPath(path); err != nil {
+		return fmt.Errorf("errore salvataggio docker root: %w", err)
+	}
+	cfg.Config.DockerRootPath = path
+	ui.PrintOK(fmt.Sprintf("Percorso salvato in %s", config.GetFilePath()))
+	return nil
+}
+
+func ensureHelmRoot(cfg *config.Config) error {
+	if cfg.Config.HelmRootPath != "" {
+		return nil
+	}
+	ui.PrintWarn("Percorso base Helm non configurato.")
+	path, cancelled := ui.RunInput("Percorso base charts Helm", "", "")
+	if cancelled {
+		return errCancelled
+	}
+	if path == "" {
+		return fmt.Errorf("percorso Helm obbligatorio")
+	}
+	if err := config.SetHelmRootPath(path); err != nil {
+		return fmt.Errorf("errore salvataggio helm root: %w", err)
+	}
+	cfg.Config.HelmRootPath = path
+	ui.PrintOK(fmt.Sprintf("Percorso salvato in %s", config.GetFilePath()))
 	return nil
 }
