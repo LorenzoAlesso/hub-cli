@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -13,6 +14,23 @@ type Item struct {
 	Value string
 	Label string
 	Desc  string
+}
+
+// dockerfileItems labels absolute Dockerfile paths relative to root: the prefix
+// is the same on every row and only widens the box. Value keeps the absolute
+// path, which is what the build needs.
+func dockerfileItems(files []string, root string) []Item {
+	items := make([]Item, len(files))
+	for i, f := range files {
+		label := f
+		if root != "" {
+			if rel, err := filepath.Rel(root, f); err == nil && !strings.HasPrefix(rel, "..") {
+				label = rel
+			}
+		}
+		items[i] = Item{Value: f, Label: label}
+	}
+	return items
 }
 
 type listModel struct {

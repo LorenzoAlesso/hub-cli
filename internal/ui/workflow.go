@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,9 +21,11 @@ type wfState int
 
 const (
 	wfECRLogin wfState = iota
+	wfRepoPrep
 	wfServiceSelect
 	wfSvcTagSync
 	wfSvcDockerfile
+	wfSvcDockerfileMissing
 	wfSvcTagInput
 	wfSvcBuildArg
 	wfSvcBuilding
@@ -30,7 +33,7 @@ const (
 	wfSvcHelm
 	wfSvcHelmError
 	wfSvcRollback
-	wfSvcPostSync
+	wfPostSync // once per workflow, not once per service
 	wfSummary
 )
 
@@ -41,7 +44,13 @@ type wfOpDoneMsg struct {
 	output []byte
 }
 
+type wfRepoPrepDoneMsg struct {
+	dir string
+	err error
+}
+
 type wfPostSyncDoneMsg struct {
+	err   error
 	lines []string
 }
 
@@ -84,34 +93,60 @@ type WorkflowModel struct {
 	valuesPath     string
 	chartVersion   string
 
+	localValues bool              // values from the working copy: test deploy, sync skipped
+	helmRepoDir string            // managed clone the values are read from, "" = working copy
+	deployed    []deployedService // services that reached the cluster, for the final commit
+	syncErr     error
+
 	results []DeployResult
 }
 
+// deployedService remembers what a finished service needs for the final sync.
+type deployedService struct {
+	name string
+	tag  string
+	svc  config.ServiceConfig
+}
+
 // RunWorkflow runs the full deploy pipeline as a single persistent BubbleTea program.
-// Returns (results, cancelled, error).
-func RunWorkflow(cfg *config.Config, dryRun, testUI bool) ([]DeployResult, bool, error) {
+// Returns (results, cancelled, syncErr, error): syncErr is not fatal, the deploy
+// already reached the cluster, but the repository no longer reflects it.
+func RunWorkflow(cfg *config.Config, dryRun, testUI, localValues bool) ([]DeployResult, bool, error, error) {
 	label := "LOCAL DEPLOY"
-	if testUI {
+	switch {
+	case testUI:
 		label = "TEST-UI"
+	case localValues:
+		label = "LOCAL DEPLOY (prova)"
 	}
 	SetStatus(label, cfg.Config.ECRRegion)
 
 	m := WorkflowModel{
-		cfg:     cfg,
-		dryRun:  dryRun,
-		testUI:  testUI,
-		state:   wfECRLogin,
-		spinner: newSpinnerModel("ECR Login"),
-		opStart: time.Now(),
+		cfg:         cfg,
+		dryRun:      dryRun,
+		testUI:      testUI,
+		localValues: localValues,
+		state:       wfECRLogin,
+		spinner:     newSpinnerModel("ECR Login"),
+		opStart:     time.Now(),
 	}
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	ClearStatus()
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	wf := final.(WorkflowModel)
-	return wf.results, wf.cancelled, nil
+	return wf.results, wf.cancelled, wf.syncErr, nil
+}
+
+// helmValuesRoot is the directory the values file is read from: the managed
+// clone, or the working copy under --local-values.
+func (m WorkflowModel) helmValuesRoot() string {
+	if m.helmRepoDir != "" {
+		return m.helmRepoDir
+	}
+	return m.cfg.Config.HelmRootPath
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -147,23 +182,33 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if done, ok := msg.(wfOpDoneMsg); ok {
 		return m.handleOpDone(done)
 	}
+	if rp, ok := msg.(wfRepoPrepDoneMsg); ok {
+		if rp.err != nil {
+			// A stale or wrong-branch values file would silently revert
+			// somebody else's change on the cluster.
+			m.log = append(m.log, ErrStyle.Render("  ✗  Allineamento del repo charts non riuscito: "+rp.err.Error()))
+			m.log = append(m.log, DimStyle.Render(
+				"      Per usare i values della copia di lavoro: hub-cli local --local-values"))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		m.helmRepoDir = rp.dir
+		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
+			"  Repo charts allineato a origin/"+config.GetHelmSyncBranch()+"  ")+
+			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
+		return m.enterServiceSelect()
+	}
 	if ps, ok := msg.(wfPostSyncDoneMsg); ok {
 		m.log = append(m.log, ps.lines...)
-		m.results = append(m.results, DeployResult{
-			Service: m.svcName,
-			OldTag:  m.oldTag,
-			NewTag:  m.newTag,
-			Elapsed: time.Since(m.svcStart),
-		})
-		m.svcIdx++
-		return m.startNextService()
+		m.syncErr = ps.err
+		return m.enterSummary()
 	}
 	return m.forwardToActive(msg)
 }
 
 func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcPostSync:
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfRepoPrep, wfPostSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
@@ -192,7 +237,7 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case wfSvcDockerfile, wfSvcHelmError:
+	case wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -200,8 +245,11 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if m.list.done {
-			if m.state == wfSvcDockerfile {
+			switch m.state {
+			case wfSvcDockerfile:
 				return m.finishDockerfile()
+			case wfSvcDockerfileMissing:
+				return m.finishDockerfileMissing()
 			}
 			return m.finishHelmError()
 		}
@@ -264,7 +312,7 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 				"aws ecr get-login-password --region %s | docker login --username AWS %s.dkr.ecr.%s.amazonaws.com",
 				m.cfg.Config.ECRRegion, m.cfg.Config.ECRAccountID, m.cfg.Config.ECRRegion)))
 		}
-		return m.enterServiceSelect()
+		return m.enterRepoPrep()
 
 	case wfSvcBuilding:
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Build  ")+ValueStyle.Render(elapsed))
@@ -280,7 +328,8 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 		if err := config.UpdateServiceTag(m.svcName, m.newTag); err != nil {
 			m.log = append(m.log, WarnStyle.Render("  ⚠  impossibile aggiornare last_tag: "+err.Error()))
 		}
-		return m.enterPostSync()
+		m.deployed = append(m.deployed, deployedService{name: m.svcName, tag: m.newTag, svc: m.svc})
+		return m.finishService()
 
 	case wfSvcRollback:
 		m.log = append(m.log, WarnStyle.Render("  ⚠  Rollback completato"))
@@ -288,6 +337,44 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// ── Managed repo prep ─────────────────────────────────────────────────────────
+
+// enterRepoPrep realigns the managed clone of the charts repo before anything is
+// deployed: the values file passed to `helm -f` is applied to the cluster, so it
+// must come from a known, freshly fetched state.
+func (m WorkflowModel) enterRepoPrep() (tea.Model, tea.Cmd) {
+	helmRoot := m.cfg.Config.HelmRootPath
+
+	switch {
+	case m.localValues:
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Deploy di prova: values dalla copia di lavoro, sync disattivato (--local-values)"))
+		return m.enterServiceSelect()
+	case m.dryRun || m.testUI:
+		if m.dryRun {
+			m.log = append(m.log, wfDryRunLine("git fetch + checkout del repo charts su "+config.GetHelmSyncBranch()))
+		}
+		return m.enterServiceSelect()
+	case helmRoot == "":
+		return m.enterServiceSelect()
+	}
+
+	remoteURL, err := logic.GitRemoteURL(helmRoot)
+	if err != nil {
+		return m, func() tea.Msg { return wfRepoPrepDoneMsg{err: err} }
+	}
+
+	m.state = wfRepoPrep
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Allineamento repo charts")
+	branch := config.GetHelmSyncBranch()
+	reposRoot := config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
+		return wfRepoPrepDoneMsg{dir: dir, err: err}
+	})
 }
 
 // ── enterServiceSelect ────────────────────────────────────────────────────────
@@ -324,7 +411,7 @@ func (m WorkflowModel) finishServiceSelect() (tea.Model, tea.Cmd) {
 
 func (m WorkflowModel) startNextService() (tea.Model, tea.Cmd) {
 	if m.svcIdx >= len(m.selectedServices) {
-		return m.enterSummary()
+		return m.enterPostSync()
 	}
 
 	m.svcName = m.selectedServices[m.svcIdx]
@@ -393,7 +480,6 @@ func (m WorkflowModel) finishTagSync() (tea.Model, tea.Cmd) {
 func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 	svc := m.svc
 	cfg := m.cfg
-	svcName := m.svcName
 
 	if svc.DockerfileSubpath != "" {
 		full := filepath.Join(cfg.Config.DockerRootPath, svc.DockerfileSubpath)
@@ -405,9 +491,49 @@ func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 				m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+abs))
 				return m.enterTagInput()
 			}
+			// A configured path that is missing usually means the repo is on a
+			// branch without this service, so scanning is the user's decision.
 			m.log = append(m.log, WarnStyle.Render("  ⚠  Dockerfile configurato non trovato: "+abs))
+			if branch, err := logic.GitCurrentBranch(cfg.Config.DockerRootPath); err == nil && branch != "" {
+				m.log = append(m.log, WarnStyle.Render("      branch corrente del repo Docker: "+branch))
+			}
+			return m.enterDockerfileMissing()
 		}
 	}
+
+	return m.enterDockerfileScan()
+}
+
+// enterDockerfileMissing asks what to do about a configured Dockerfile that is
+// not on disk. Cancelling comes first, so the safe answer is preselected.
+func (m WorkflowModel) enterDockerfileMissing() (tea.Model, tea.Cmd) {
+	m.state = wfSvcDockerfileMissing
+	m.list = listModel{
+		title: "Dockerfile di " + m.svcName + " non trovato",
+		items: []Item{
+			{Value: "cancel", Label: "Annulla  — interrompe il deploy senza buildare"},
+			{Value: "scan", Label: "Cerca comunque un Dockerfile", Desc: "l'immagine verrà pushata come " + m.svcName},
+		},
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishDockerfileMissing() (tea.Model, tea.Cmd) {
+	if m.list.selected != "scan" {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.svcName+" non trovato"))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	return m.enterDockerfileScan()
+}
+
+// enterDockerfileScan discovers Dockerfiles under the Docker root. What it finds
+// is always offered for confirmation: the destination comes from the config
+// whatever is picked, so a wrong pick deploys the wrong image successfully.
+func (m WorkflowModel) enterDockerfileScan() (tea.Model, tea.Cmd) {
+	cfg := m.cfg
+	svcName := m.svcName
 
 	searchRoot := cfg.Config.DockerRootPath
 	if prefix := wfProjectPrefix(svcName); prefix != "" {
@@ -427,23 +553,30 @@ func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", cfg.Config.DockerRootPath)))
 		return m, tea.Quit
 	}
-	if len(files) == 1 {
-		m.dockerfilePath = files[0]
-		m.discovered = true
-		m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+files[0]))
-		return m.enterTagInput()
-	}
 	return m.enterDockerfileList(files)
 }
 
 func (m WorkflowModel) enterDockerfileList(files []string) (tea.Model, tea.Cmd) {
 	m.state = wfSvcDockerfile
-	items := make([]Item, len(files))
-	for i, f := range files {
-		items[i] = Item{Value: f, Label: f}
+	items := dockerfileItems(files, m.cfg.Config.DockerRootPath)
+	m.list = listModel{
+		title: wfDockerfileListTitle(m.svcName, m.svc.ECRRepository),
+		items: items,
+		width: m.width,
 	}
-	m.list = listModel{title: "Seleziona Dockerfile", items: items, width: m.width}
 	return m, m.list.Init()
+}
+
+// wfDockerfileListTitle names the destination in the title: it comes from the
+// config whatever file is picked, so a mismatch is visible while choosing.
+func wfDockerfileListTitle(serviceName, ecrRepository string) string {
+	title := "Seleziona Dockerfile da buildare come " + serviceName
+	if ecrRepository != "" {
+		if idx := strings.Index(ecrRepository, "/"); idx != -1 {
+			title += " → " + ecrRepository[idx+1:]
+		}
+	}
+	return title
 }
 
 func (m WorkflowModel) finishDockerfile() (tea.Model, tea.Cmd) {
@@ -451,6 +584,13 @@ func (m WorkflowModel) finishDockerfile() (tea.Model, tea.Cmd) {
 	m.discovered = true
 	m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+m.dockerfilePath))
 	return m.enterTagInput()
+}
+
+// shouldPersistDockerfilePath reports whether a discovered path is worth saving
+// back to the config. A service that already declares one keeps it: overwriting
+// would replace a correct value with one found on the wrong branch.
+func (m WorkflowModel) shouldPersistDockerfilePath() bool {
+	return m.discovered && m.svc.DockerfileSubpath == "" && !m.testUI
 }
 
 // ── Tag input ─────────────────────────────────────────────────────────────────
@@ -474,7 +614,7 @@ func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	}
 	m.newTag = val
 
-	if m.discovered && !m.testUI && m.cfg.Config.DockerRootPath != "" {
+	if m.shouldPersistDockerfilePath() && m.cfg.Config.DockerRootPath != "" {
 		rel, relErr := filepath.Rel(m.cfg.Config.DockerRootPath, m.dockerfilePath)
 		if relErr != nil {
 			rel = m.dockerfilePath
@@ -528,7 +668,7 @@ func (m WorkflowModel) finishBuildArg() (tea.Model, tea.Cmd) {
 // ── Build ─────────────────────────────────────────────────────────────────────
 
 func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
-	m.valuesPath = filepath.Join(m.cfg.Config.HelmRootPath, m.svc.HelmValuesPath)
+	m.valuesPath = filepath.Join(m.helmValuesRoot(), m.svc.HelmValuesPath)
 	m.chartVersion = m.svc.ChartVersion
 	if m.chartVersion == "" {
 		m.chartVersion = m.cfg.Config.ChartVersion
@@ -662,27 +802,34 @@ func (m WorkflowModel) enterRollback() (tea.Model, tea.Cmd) {
 
 // ── Post-deploy sync ──────────────────────────────────────────────────────────
 
+// enterPostSync runs once, after every selected service has been deployed: one
+// commit for the whole run means fewer pushes and fewer races.
 func (m WorkflowModel) enterPostSync() (tea.Model, tea.Cmd) {
-	helmRoot := config.GetHelmRootPath()
-	dockerRoot := config.GetDockerRootPath()
-	hasHelm := helmRoot != "" && m.svc.HelmValuesPath != "" && m.svc.HelmSetKey != ""
-	hasDocker := dockerRoot != "" && m.svc.K8sManifestPath != "" && m.svc.K8sImageRef != ""
-
-	if !hasHelm && !hasDocker {
-		return m.finishService()
+	if len(m.deployed) == 0 {
+		return m.enterSummary()
+	}
+	if m.localValues {
+		// The cluster runs a values file that exists in no commit: the tag on
+		// the shared branch would describe an unreproducible state.
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Sync saltato: deploy di prova con i values della copia di lavoro"))
+		return m.enterSummary()
+	}
+	if m.dryRun || m.testUI {
+		if m.dryRun {
+			m.log = append(m.log, wfDryRunLine("aggiornamento values + commit e push sul repo gestito"))
+		}
+		return m.enterSummary()
 	}
 
-	m.state = wfSvcPostSync
+	m.state = wfPostSync
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Aggiornamento repo")
+	m.spinner = newSpinnerModel("Sync repo")
 	cfg := m.cfg
-	svc := m.svc
-	svcName := m.svcName
-	newTag := m.newTag
-	valuesPath := m.valuesPath
+	deployed := m.deployed
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		lines := wfRunPostDeploySync(cfg, svc, svcName, newTag, valuesPath)
-		return wfPostSyncDoneMsg{lines: lines}
+		lines, err := wfRunPostDeploySync(cfg, deployed)
+		return wfPostSyncDoneMsg{lines: lines, err: err}
 	})
 }
 
@@ -713,14 +860,14 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcPostSync:
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfRepoPrep, wfPostSync:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinnerFrame(), elapsed))
 	case wfServiceSelect:
 		sb.WriteString(m.multisel.View().Content)
 	case wfSvcTagSync:
 		sb.WriteString(m.confirm.View().Content)
-	case wfSvcDockerfile, wfSvcHelmError:
+	case wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
 		sb.WriteString(m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
 		sb.WriteString(m.input.View().Content)
@@ -825,14 +972,14 @@ func (m WorkflowModel) renderPipelineStages() string {
 			return stDone
 		}
 		switch m.state {
-		case wfSvcTagSync, wfSvcDockerfile, wfSvcTagInput, wfSvcBuildArg:
+		case wfSvcTagSync, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcTagInput, wfSvcBuildArg:
 			return stInteractive
 		}
 		return stPending
 	}
 
 	deployStatus := func() stStatus {
-		if m.state >= wfSvcPostSync {
+		if m.state >= wfPostSync {
 			return stDone
 		}
 		if m.state == wfSvcHelm || m.state == wfSvcRollback {
@@ -853,7 +1000,7 @@ func (m WorkflowModel) renderPipelineStages() string {
 		{"Build", asyncStatus(wfSvcBuilding, wfSvcPushing)},
 		{"Push", asyncStatus(wfSvcPushing, wfSvcHelm)},
 		{"Deploy", deployStatus()},
-		{"Sync", asyncStatus(wfSvcPostSync, wfSummary)},
+		{"Sync", asyncStatus(wfPostSync, wfSummary)},
 	}
 
 	frame := m.spinnerFrame()
@@ -913,46 +1060,115 @@ func wfSortedServiceKeys(m map[string]config.ServiceConfig) []string {
 	return keys
 }
 
-func wfRunPostDeploySync(cfg *config.Config, svc config.ServiceConfig, serviceName, newTag, valuesPath string) []string {
+// wfRunPostDeploySync writes the deployed tags back to the repositories, one
+// commit per repository. A failure is reported, never swallowed: the branch
+// everybody deploys from would no longer match the cluster.
+func wfRunPostDeploySync(cfg *config.Config, deployed []deployedService) ([]string, error) {
 	var lines []string
-	helmRoot := config.GetHelmRootPath()
-	dockerRoot := config.GetDockerRootPath()
-	commitMsg := logic.DeployCommitMessage(serviceName, newTag)
+	var failures []error
 
-	if helmRoot != "" && svc.HelmValuesPath != "" && svc.HelmSetKey != "" {
-		if err := logic.UpdateHelmValuesTag(valuesPath, svc.HelmSetKey, newTag, svc.HelmImagePath); err != nil {
-			lines = append(lines, WarnStyle.Render("  ⚠  helm values non aggiornato: "+err.Error()))
-		} else {
-			lines = append(lines, SuccessStyle.Render("  ✓  Helm values aggiornato ("+svc.HelmValuesPath+")"))
-			if err := logic.GitAdd(helmRoot, svc.HelmValuesPath); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git add helm: "+err.Error()))
-			} else if err := logic.GitCommit(helmRoot, commitMsg); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git commit helm: "+err.Error()))
-			} else if err := logic.GitPush(helmRoot); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git push helm: "+err.Error()))
-			} else {
-				lines = append(lines, SuccessStyle.Render("  ✓  Helm repo: commit e push completati."))
-			}
+	message := logic.DeployCommitMessageFor(wfDeployedServices(deployed))
+	reposRoot := config.GetReposRoot()
+
+	if targets := wfHelmTargets(deployed); len(targets) > 0 && cfg.Config.HelmRootPath != "" {
+		ls, err := wfSyncRepo(
+			cfg.Config.HelmRootPath, config.GetHelmSyncBranch(), reposRoot, message, "charts",
+			func(dir string) ([]string, error) {
+				var changed []string
+				for _, d := range targets {
+					path := filepath.Join(dir, d.svc.HelmValuesPath)
+					if err := logic.UpdateHelmValuesTag(path, d.svc.HelmSetKey, d.tag, d.svc.HelmImagePath); err != nil {
+						return nil, fmt.Errorf("%s: %w", d.name, err)
+					}
+					changed = append(changed, d.svc.HelmValuesPath)
+				}
+				return wfUnique(changed), nil
+			})
+		lines = append(lines, ls...)
+		if err != nil {
+			failures = append(failures, err)
 		}
 	}
 
-	if dockerRoot != "" && svc.K8sManifestPath != "" && svc.K8sImageRef != "" {
-		manifestAbs := filepath.Join(dockerRoot, svc.K8sManifestPath)
-		if err := logic.UpdateK8sManifestImage(manifestAbs, svc.K8sImageRef, newTag); err != nil {
-			lines = append(lines, WarnStyle.Render("  ⚠  k8s manifest non aggiornato: "+err.Error()))
-		} else {
-			lines = append(lines, SuccessStyle.Render("  ✓  K8s manifest aggiornato ("+svc.K8sManifestPath+")"))
-			if err := logic.GitAdd(dockerRoot, svc.K8sManifestPath); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git add docker: "+err.Error()))
-			} else if err := logic.GitCommit(dockerRoot, commitMsg); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git commit docker: "+err.Error()))
-			} else if err := logic.GitPush(dockerRoot); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git push docker: "+err.Error()))
-			} else {
-				lines = append(lines, SuccessStyle.Render("  ✓  Docker repo: commit e push completati."))
-			}
+	if targets := wfManifestTargets(deployed); len(targets) > 0 && cfg.Config.DockerRootPath != "" {
+		ls, err := wfSyncRepo(
+			cfg.Config.DockerRootPath, config.GetDockerSyncBranch(), reposRoot, message, "manifest k8s",
+			func(dir string) ([]string, error) {
+				var changed []string
+				for _, d := range targets {
+					path := filepath.Join(dir, d.svc.K8sManifestPath)
+					if err := logic.UpdateK8sManifestImage(path, d.svc.K8sImageRef, d.tag); err != nil {
+						return nil, fmt.Errorf("%s: %w", d.name, err)
+					}
+					changed = append(changed, d.svc.K8sManifestPath)
+				}
+				return wfUnique(changed), nil
+			})
+		lines = append(lines, ls...)
+		if err != nil {
+			failures = append(failures, err)
 		}
 	}
 
-	return lines
+	return lines, errors.Join(failures...)
+}
+
+// wfSyncRepo pushes one repository's share of the deploy and logs the outcome.
+func wfSyncRepo(workingCopy, branch, reposRoot, message, label string,
+	apply func(dir string) ([]string, error)) ([]string, error) {
+
+	remoteURL, err := logic.GitRemoteURL(workingCopy)
+	if err != nil {
+		return []string{ErrStyle.Render("  ✗  Sync " + label + " non riuscito: " + err.Error())}, err
+	}
+
+	if err := logic.SyncToBranch(remoteURL, branch, reposRoot, message, apply, nil); err != nil {
+		return []string{
+			ErrStyle.Render("  ✗  Sync " + label + " non riuscito: " + err.Error()),
+			WarnStyle.Render("      Il branch " + branch + " non riflette più lo stato del cluster."),
+		}, err
+	}
+
+	return []string{SuccessStyle.Render("  ✓  Sync " + label + ": commit e push su " + branch)}, nil
+}
+
+func wfDeployedServices(deployed []deployedService) []logic.DeployedService {
+	out := make([]logic.DeployedService, 0, len(deployed))
+	for _, d := range deployed {
+		out = append(out, logic.DeployedService{Name: d.name, Tag: d.tag})
+	}
+	return out
+}
+
+func wfHelmTargets(deployed []deployedService) []deployedService {
+	var out []deployedService
+	for _, d := range deployed {
+		if d.svc.HelmValuesPath != "" && d.svc.HelmSetKey != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func wfManifestTargets(deployed []deployedService) []deployedService {
+	var out []deployedService
+	for _, d := range deployed {
+		if d.svc.K8sManifestPath != "" && d.svc.K8sImageRef != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// wfUnique drops repeats: several services can share one values file.
+func wfUnique(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	var out []string
+	for _, p := range paths {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }

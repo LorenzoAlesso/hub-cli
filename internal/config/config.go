@@ -40,6 +40,9 @@ func SeedFilePath() string {
 type GlobalConfig struct {
 	DockerRootPath   string `mapstructure:"docker_root_path"`
 	HelmRootPath     string `mapstructure:"helm_root_path"`
+	HelmSyncBranch   string `mapstructure:"helm_sync_branch"`
+	DockerSyncBranch string `mapstructure:"docker_sync_branch"`
+	ReposRoot        string `mapstructure:"repos_root"`
 	ECRRegion        string `mapstructure:"ecr_region"`
 	ECRAccountID     string `mapstructure:"ecr_account_id"`
 	ChartVersion     string `mapstructure:"chart_version"`
@@ -81,10 +84,9 @@ func (c PSNClusterConfig) IsProd() bool {
 
 // PSNProjectConfig overrides Dockerfile resolution for the namespaces matching
 // Namespace (glob, e.g. "app-*"): builds use DockerRoot instead of the global
-// docker_root_path. BranchColl/BranchProd are the git branches DockerRoot is
-// expected to be on for collaudo/produzione clusters — when set, the workflow
-// verifies the branch (offering a checkout) before building, because the
-// branch determines what gets baked into the images.
+// docker_root_path. BranchColl/BranchProd are the git branches to build from on
+// collaudo/produzione clusters — when set, builds run from a managed clone
+// aligned to that branch, because the branch determines the image contents.
 type PSNProjectConfig struct {
 	Namespace   string            `mapstructure:"namespace"   yaml:"namespace"`
 	DockerRoot  string            `mapstructure:"docker_root" yaml:"docker_root"`
@@ -535,4 +537,25 @@ func GetDockerRootPath() string {
 
 func GetHelmRootPath() string {
 	return viper.GetString("config.helm_root_path")
+}
+
+// DefaultSyncBranch is used when the config declares no sync branch.
+const DefaultSyncBranch = "master"
+
+func GetHelmSyncBranch() string {
+	if b := strings.TrimSpace(viper.GetString("config.helm_sync_branch")); b != "" {
+		return b
+	}
+	return DefaultSyncBranch
+}
+
+func GetDockerSyncBranch() string {
+	if b := strings.TrimSpace(viper.GetString("config.docker_sync_branch")); b != "" {
+		return b
+	}
+	return DefaultSyncBranch
+}
+
+func GetReposRoot() string {
+	return viper.GetString("config.repos_root")
 }

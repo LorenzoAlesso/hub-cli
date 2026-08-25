@@ -85,10 +85,12 @@ func ApplyTheme(t Theme) {
 	rebuildStyles()
 }
 
-// InitTheme applies the named theme; falls back to the auto-detected one if the name is empty or unknown.
+// InitTheme applies the named theme; with an empty or unknown name it adapts to
+// the terminal background instead.
 func InitTheme(name string) {
 	if t, ok := ThemeByName(name); ok {
 		ApplyTheme(t)
+		return
 	}
-	// "auto" or unknown: keep the palette set by styles.go init().
+	DetectTerminalBackground()
 }

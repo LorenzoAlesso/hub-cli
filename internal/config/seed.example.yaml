@@ -30,6 +30,26 @@ config:
   # viene chiesto interattivamente. Impostalo qui per saltare il prompt.
   # local_kube_context: kubernetes-admin@kubernetes
 
+  # ── Repo gestiti ──────────────────────────────────────────────────────
+  # hub-cli mantiene cloni propri dei repo (charts e Docker) e li riallinea a
+  # origin a ogni esecuzione. Serve perché le copie di lavoro sono condivise
+  # con lo sviluppo quotidiano: cambio di branch, modifiche non committate,
+  # e soprattutto push fatti da altre persone senza passare da hub-cli.
+  #
+  # Da questi cloni vengono letti il values passato a `helm -f` e, su PSN,
+  # i Dockerfile della build. Gli URL non si configurano: si ricavano dal
+  # remote origin di helm_root_path / docker_root_path.
+
+  # Branch del repo dei chart da cui si legge il values e su cui atterra il
+  # commit del tag. Default: master.
+  # helm_sync_branch: master
+
+  # Branch del repo Docker per il sync di k8s_manifest_path. Default: master.
+  # docker_sync_branch: master
+
+  # Cartella che ospita i cloni gestiti. Default: ~/.hub-cli/repos
+  # repos_root: ""
+
 services:
   my-service:
     # Tag iniziale che verrà mostrato come "ultimo deploy"

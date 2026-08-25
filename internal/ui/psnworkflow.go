@@ -20,12 +20,12 @@ type psnState int
 const (
 	psnNsLoading psnState = iota
 	psnNsSelect
-	psnBranchConfirm
-	psnBranchSwitch
+	psnRepoPrep
 	psnDepLoading
 	psnDepSelect
 	psnTagInput
 	psnDockerfileList
+	psnDockerfileMissing
 	psnBuildArg
 	psnBuilding
 	psnPushing
@@ -41,6 +41,11 @@ const (
 type psnOpDoneMsg struct {
 	err    error
 	output []byte
+}
+
+type psnRepoPrepDoneMsg struct {
+	dir string
+	err error
 }
 
 type psnNsLoadedMsg struct {
@@ -74,17 +79,16 @@ type PSNWorkflowModel struct {
 	multisel multiSelectModel
 	input    inputModel
 	list     listModel
-	confirm  confirmModel
 
 	opStart time.Time
 
-	namespace      string
-	project        *config.PSNProjectConfig // per-namespace Dockerfile resolution override
-	originalBranch string                   // project repo branch before the guard's checkout
-	branchSwitched bool                     // restore originalBranch once the workflow ends
-	depByName      map[string]logic.DeploymentInfo
-	selectedDeps   []string
-	depIdx         int
+	namespace    string
+	project      *config.PSNProjectConfig // per-namespace Dockerfile resolution override
+	projectDir   string                   // managed clone of the project repo, "" = working copy
+	scanRoot     string                   // root of a pending Dockerfile scan, set before psnDockerfileMissing
+	depByName    map[string]logic.DeploymentInfo
+	selectedDeps []string
+	depIdx       int
 
 	dep            logic.DeploymentInfo
 	repo           string // registry + path, no tag
@@ -126,27 +130,7 @@ func RunPSNWorkflow(cfg *config.Config, cluster config.PSNClusterConfig, dryRun,
 		return nil, false, err
 	}
 	wf := final.(PSNWorkflowModel)
-	wf.restoreProjectBranch()
 	return wf.results, wf.cancelled, nil
-}
-
-// restoreProjectBranch puts the project repo back on its original branch after
-// the workflow's checkout: the repo is shared with the local workflow, which
-// must not inherit a PSN branch. Runs after the TUI has ended.
-func (m PSNWorkflowModel) restoreProjectBranch() {
-	if !m.branchSwitched || m.originalBranch == "" || m.project == nil {
-		return
-	}
-	clean, err := logic.GitIsClean(m.project.DockerRoot)
-	if err != nil || !clean {
-		PrintWarn(fmt.Sprintf("Branch %q non ripristinato su %s: repo non pulito", m.originalBranch, m.project.DockerRoot))
-		return
-	}
-	if err := logic.GitCheckout(m.project.DockerRoot, m.originalBranch); err != nil {
-		PrintWarn("Ripristino branch fallito: " + err.Error())
-		return
-	}
-	PrintOK(fmt.Sprintf("Repo Docker ripristinato sul branch %q", m.originalBranch))
 }
 
 // In dry-run/test-ui the kube context is not pointed at the PSN cluster, so
@@ -197,6 +181,18 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if dep, ok := msg.(psnDepLoadedMsg); ok {
 		return m.handleDepLoaded(dep)
 	}
+	if rp, ok := msg.(psnRepoPrepDoneMsg); ok {
+		if rp.err != nil {
+			m.log = append(m.log, ErrStyle.Render("  ✗  Allineamento del repo progetto non riuscito: "+rp.err.Error()))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		m.projectDir = rp.dir
+		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
+			"  Repo progetto allineato a origin/"+m.project.ExpectedBranch(m.cluster)+"  ")+
+			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
+		return m.enterDepLoading()
+	}
 	if done, ok := msg.(psnOpDoneMsg); ok {
 		return m.handleOpDone(done)
 	}
@@ -205,24 +201,12 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case psnNsLoading, psnBranchSwitch, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
+	case psnNsLoading, psnRepoPrep, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnBranchConfirm:
-		sm, cmd := m.confirm.Update(msg)
-		m.confirm = sm.(confirmModel)
-		if m.confirm.quit {
-			m.cancelled = true
-			return m, tea.Quit
-		}
-		if m.confirm.done {
-			return m.finishBranchConfirm()
-		}
-		return m, cmd
-
-	case psnNsSelect, psnDockerfileList, psnDeployError:
+	case psnNsSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -235,6 +219,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishNsSelect()
 			case psnDockerfileList:
 				return m.finishDockerfile()
+			case psnDockerfileMissing:
+				return m.finishDockerfileMissing()
 			default:
 				return m.finishDeployError()
 			}
@@ -305,74 +291,50 @@ func (m PSNWorkflowModel) finishNsSelect() (tea.Model, tea.Cmd) {
 	if m.project != nil {
 		m.log = append(m.log, DimStyle.Render("  ·  Progetto Docker dedicato: "+m.project.DockerRoot))
 		if want := m.project.ExpectedBranch(m.cluster); want != "" {
-			return m.checkProjectBranch(want)
+			return m.enterProjectRepoPrep(want)
 		}
 	}
 	return m.enterDepLoading()
 }
 
-// ── Project branch guard ──────────────────────────────────────────────────────
+// ── Project repo preparation ──────────────────────────────────────────────────
 
-// checkProjectBranch verifies the project repo is on the branch expected for
-// the cluster environment: the branch determines what gets baked into the
-// images (certs, source branches), so building from the wrong one is blocked.
-func (m PSNWorkflowModel) checkProjectBranch(want string) (tea.Model, tea.Cmd) {
-	current, err := logic.GitCurrentBranch(m.project.DockerRoot)
+// enterProjectRepoPrep realigns the managed clone of the project repo to the
+// branch this environment builds from: the branch decides what ends up inside
+// the images, and colleagues push to it without going through hub-cli.
+func (m PSNWorkflowModel) enterProjectRepoPrep(want string) (tea.Model, tea.Cmd) {
+	if m.dryRun || m.testUI {
+		if m.dryRun {
+			m.log = append(m.log, wfDryRunLine(fmt.Sprintf(
+				"git fetch + checkout di %s su %s (repo gestito)", m.project.DockerRoot, want)))
+		}
+		return m.enterDepLoading()
+	}
+
+	remoteURL, err := logic.GitRemoteURL(m.project.DockerRoot)
 	if err != nil {
 		m.log = append(m.log, ErrStyle.Render("  ✗  "+err.Error()))
+		m.cancelled = true
 		return m, tea.Quit
 	}
-	if current == want {
-		m.log = append(m.log, SuccessStyle.Render(fmt.Sprintf("  ✓  Branch Docker %q corretto per l'ambiente", current)))
-		return m.enterDepLoading()
-	}
-	if m.dryRun {
-		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("git checkout %s  (repo %s, branch attuale %q)",
-			want, m.project.DockerRoot, current)))
-		return m.enterDepLoading()
-	}
 
-	m.originalBranch = current
-	m.state = psnBranchConfirm
-	m.confirm = confirmModel{
-		title: "Branch del progetto Docker non corretto — checkout?",
-		body: fmt.Sprintf("  %s  %s\n  %s  %s\n  %s  %s",
-			LabelStyle.Render("Repo:    "), ValueStyle.Render(m.project.DockerRoot),
-			LabelStyle.Render("Attuale: "), WarnStyle.Render(current),
-			LabelStyle.Render("Atteso:  "), SuccessStyle.Render(want)),
-		width: m.width,
-	}
-	return m, m.confirm.Init()
+	m.state = psnRepoPrep
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Allineamento repo progetto (" + want + ")")
+	reposRoot := config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, want, reposRoot, nil)
+		return psnRepoPrepDoneMsg{dir: dir, err: err}
+	})
 }
 
-func (m PSNWorkflowModel) finishBranchConfirm() (tea.Model, tea.Cmd) {
-	want := m.project.ExpectedBranch(m.cluster)
-	if m.confirm.choice != 0 {
-		// Building from the wrong branch would bake the wrong environment
-		// into the images: refusing the checkout stops the deploy.
-		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Deploy annullato: il repo non è sul branch %q", want)))
-		m.cancelled = true
-		return m, tea.Quit
+// projectRoot is the directory the build reads from: the managed clone when the
+// project declares a branch, the working copy otherwise.
+func (m PSNWorkflowModel) projectRoot() string {
+	if m.projectDir != "" {
+		return m.projectDir
 	}
-
-	clean, err := logic.GitIsClean(m.project.DockerRoot)
-	if err != nil {
-		m.log = append(m.log, ErrStyle.Render("  ✗  "+err.Error()))
-		return m, tea.Quit
-	}
-	if !clean {
-		m.log = append(m.log, ErrStyle.Render("  ✗  Il repo ha modifiche non committate: checkout non sicuro. Sistemalo e rilancia."))
-		m.cancelled = true
-		return m, tea.Quit
-	}
-
-	m.state = psnBranchSwitch
-	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("git checkout " + want)
-	root := m.project.DockerRoot
-	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		return psnOpDoneMsg{err: logic.GitCheckout(root, want)}
-	})
+	return m.project.DockerRoot
 }
 
 // ── Deployment loading ────────────────────────────────────────────────────────
@@ -533,40 +495,68 @@ func (m PSNWorkflowModel) resolveDockerfile() (tea.Model, tea.Cmd) {
 					return m.afterDockerfile()
 				}
 				m.log = append(m.log, WarnStyle.Render("  ⚠  Dockerfile del servizio mappato non trovato: "+abs))
+				return m.enterDockerfileMissing(m.cfg.Config.DockerRootPath)
 			}
 		} else {
 			m.log = append(m.log, WarnStyle.Render(fmt.Sprintf(
 				"  ⚠  Mapping %q → servizio %q non risolvibile in config", m.dep.Name, svcName)))
+			return m.enterDockerfileMissing(m.cfg.Config.DockerRootPath)
 		}
 	}
 
-	searchRoot := m.cfg.Config.DockerRootPath
-	m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  Scansione Dockerfile in %s...", searchRoot)))
+	return m.enterDockerfileScan(m.cfg.Config.DockerRootPath)
+}
 
-	files, err := logic.FindDockerfiles(searchRoot)
-	if err != nil || len(files) == 0 {
-		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", searchRoot)))
+// enterDockerfileMissing asks what to do when the configured resolution fails.
+// The choice does not affect the destination — the image goes to the ACR
+// repository this deployment already runs — so cancelling comes first.
+func (m PSNWorkflowModel) enterDockerfileMissing(scanRoot string) (tea.Model, tea.Cmd) {
+	m.scanRoot = scanRoot
+	m.state = psnDockerfileMissing
+	m.list = listModel{
+		title: "Dockerfile di " + m.dep.Name + " non risolto",
+		items: []Item{
+			{Value: "cancel", Label: "Annulla  — interrompe il deploy senza buildare"},
+			{Value: "scan", Label: "Cerca comunque un Dockerfile", Desc: "l'immagine verrà pushata su " + m.repo},
+		},
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m PSNWorkflowModel) finishDockerfileMissing() (tea.Model, tea.Cmd) {
+	if m.list.selected != "scan" {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.dep.Name+" non risolto"))
+		m.cancelled = true
 		return m, tea.Quit
 	}
-	if len(files) == 1 {
-		m.dockerfilePath = files[0]
-		m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+files[0]))
-		return m.afterDockerfile()
+	return m.enterDockerfileScan(m.scanRoot)
+}
+
+// enterDockerfileScan offers what it finds: a discovered Dockerfile is never
+// used without being shown.
+func (m PSNWorkflowModel) enterDockerfileScan(root string) (tea.Model, tea.Cmd) {
+	m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  Scansione Dockerfile in %s...", root)))
+
+	files, err := logic.FindDockerfiles(root)
+	if err != nil || len(files) == 0 {
+		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", root)))
+		return m, tea.Quit
 	}
 
 	m.state = psnDockerfileList
-	items := make([]Item, len(files))
-	for i, f := range files {
-		items[i] = Item{Value: f, Label: f}
+	m.list = listModel{
+		title: wfDockerfileListTitle(m.dep.Name, m.repo),
+		items: dockerfileItems(files, root),
+		width: m.width,
 	}
-	m.list = listModel{title: "Seleziona Dockerfile", items: items, width: m.width}
 	return m, m.list.Init()
 }
 
 // resolveProjectDockerfile resolves inside the project's docker_root:
 // explicit mapping → convention "<deployment>/Dockerfile" → full scan.
 func (m PSNWorkflowModel) resolveProjectDockerfile() (tea.Model, tea.Cmd) {
-	root := m.project.DockerRoot
+	root := m.projectRoot()
 
 	if rel, ok := m.project.Deployments[strings.ToLower(m.dep.Name)]; ok && rel != "" {
 		full := filepath.Join(root, rel)
@@ -576,6 +566,7 @@ func (m PSNWorkflowModel) resolveProjectDockerfile() (tea.Model, tea.Cmd) {
 			return m.afterDockerfile()
 		}
 		m.log = append(m.log, WarnStyle.Render("  ⚠  Dockerfile mappato non trovato: "+full))
+		return m.enterDockerfileMissing(root)
 	}
 
 	conventional := filepath.Join(root, m.dep.Name, "Dockerfile")
@@ -585,25 +576,7 @@ func (m PSNWorkflowModel) resolveProjectDockerfile() (tea.Model, tea.Cmd) {
 		return m.afterDockerfile()
 	}
 
-	m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  Scansione Dockerfile in %s...", root)))
-	files, err := logic.FindDockerfiles(root)
-	if err != nil || len(files) == 0 {
-		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", root)))
-		return m, tea.Quit
-	}
-	if len(files) == 1 {
-		m.dockerfilePath = files[0]
-		m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+files[0]))
-		return m.afterDockerfile()
-	}
-
-	m.state = psnDockerfileList
-	items := make([]Item, len(files))
-	for i, f := range files {
-		items[i] = Item{Value: f, Label: f}
-	}
-	m.list = listModel{title: "Seleziona Dockerfile", items: items, width: m.width}
-	return m, m.list.Init()
+	return m.enterDockerfileScan(root)
 }
 
 func (m PSNWorkflowModel) finishDockerfile() (tea.Model, tea.Cmd) {
@@ -805,10 +778,6 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 
 	if msg.err != nil {
 		switch m.state {
-		case psnBranchSwitch:
-			m.log = append(m.log, ErrStyle.Render("  ✗  "+msg.err.Error()))
-			m.cancelled = true
-			return m, tea.Quit
 		case psnBuilding:
 			m.log = append(m.log, ErrStyle.Render("  ✗  Docker Build fallito"))
 			if len(msg.output) > 0 {
@@ -838,12 +807,6 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.state {
-	case psnBranchSwitch:
-		m.branchSwitched = true
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+
-			DimStyle.Render("  Checkout su "+m.project.ExpectedBranch(m.cluster)+"  ")+ValueStyle.Render(elapsed))
-		return m.enterDepLoading()
-
 	case psnBuilding:
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Build  ")+ValueStyle.Render(elapsed))
 		return m.enterPush()
@@ -885,12 +848,10 @@ func (m PSNWorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case psnNsLoading, psnBranchSwitch, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
+	case psnNsLoading, psnRepoPrep, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinner.spinner.View(), elapsed))
-	case psnBranchConfirm:
-		sb.WriteString(m.confirm.View().Content)
-	case psnNsSelect, psnDockerfileList, psnDeployError:
+	case psnNsSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
 		sb.WriteString(m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString(m.multisel.View().Content)
@@ -990,7 +951,7 @@ func (m PSNWorkflowModel) renderPipelineStages() string {
 			return stDone
 		}
 		switch m.state {
-		case psnTagInput, psnDockerfileList, psnBuildArg:
+		case psnTagInput, psnDockerfileList, psnDockerfileMissing, psnBuildArg:
 			return stInteractive
 		}
 		return stPending

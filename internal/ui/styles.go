@@ -69,7 +69,6 @@ var (
 )
 
 // rebuildStyles rebuilds every style from the current palette colors.
-// Called from init() after overriding colors for light terminals.
 func rebuildStyles() {
 	TitleStyle = lipgloss.NewStyle().Foreground(Accent).Bold(true).MarginBottom(1)
 	LabelStyle = lipgloss.NewStyle().Foreground(Muted)
@@ -90,11 +89,21 @@ func rebuildStyles() {
 	SecondaryStyle = lipgloss.NewStyle().Foreground(Secondary).Bold(true)
 }
 
-func init() {
+// DetectTerminalBackground adapts the palette to the terminal background. Only a
+// real console is asked: the query waits for a reply that never arrives when
+// stdout is redirected, or from an MSYS pipe that only claims to be a terminal.
+func DetectTerminalBackground() {
+	if !isCharDevice(os.Stdin) || !isCharDevice(os.Stdout) {
+		return // no terminal to ask: keep the dark palette
+	}
 	if lipgloss.HasDarkBackground(os.Stdin, os.Stdout) {
 		return // dark palette is already correct
 	}
-	// Light terminal: use darker, more saturated variants for readability.
+	applyLightPalette()
+}
+
+// applyLightPalette switches to darker variants for a light terminal.
+func applyLightPalette() {
 	Accent = lipgloss.Color("#0077AA")
 	Secondary = lipgloss.Color("#2A6E2A")
 	Muted = lipgloss.Color("#555570")
@@ -103,4 +112,10 @@ func init() {
 	Err = lipgloss.Color("#AA2020")
 	White = lipgloss.Color("#0D0D20")
 	rebuildStyles()
+}
+
+// isCharDevice reports whether f is a console rather than a pipe or a file.
+func isCharDevice(f *os.File) bool {
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }

@@ -47,7 +47,7 @@ func runLocalWorkflow() error {
 		return fmt.Errorf("--dry-run e --test-ui non possono essere usati insieme")
 	}
 
-	results, cancelled, err := ui.RunWorkflow(cfg, dryRun, testUI)
+	results, cancelled, syncErr, err := ui.RunWorkflow(cfg, dryRun, testUI, localValues)
 	if err != nil {
 		return err
 	}
@@ -62,6 +62,13 @@ func runLocalWorkflow() error {
 		}
 	} else if len(results) > 1 {
 		ui.PrintMultiDeploySummary(results)
+	}
+
+	// Not a failure of the run — the deploy reached the cluster — but the
+	// repository no longer describes what is running.
+	if syncErr != nil {
+		ui.PrintErr("Sync dei repo non riuscito: " + syncErr.Error())
+		ui.PrintWarn("I values sul branch condiviso non riflettono il deploy appena eseguito.")
 	}
 	return nil
 }
