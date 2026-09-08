@@ -16,7 +16,7 @@ type SeedStatus int
 
 const (
 	SeedNone     SeedStatus = iota // config already exists; no seeding performed
-	SeedFromFile                   // config created and populated from ~/.hub-cli.seed.yaml
+	SeedFromFile                   // config created and populated from the seed file
 	SeedEmpty                      // config created empty (seed file absent)
 )
 
@@ -28,13 +28,74 @@ func WasSeeded() bool { return freshlySeededStatus != SeedNone }
 // SeededFromFile reports whether first-run loaded services from the seed YAML.
 func SeededFromFile() bool { return freshlySeededStatus == SeedFromFile }
 
+// StateDir is the single directory holding everything hub-cli owns: the user
+// config, the seed and the managed clones.
+func StateDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("impossibile trovare la home directory: %w", err)
+	}
+	return filepath.Join(home, ".hub-cli"), nil
+}
+
+// ConfigFilePath returns the default path of the user config.
+func ConfigFilePath() (string, error) {
+	dir, err := StateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.yaml"), nil
+}
+
 // SeedFilePath returns the expected path of the user's seed file.
 func SeedFilePath() string {
-	home, err := os.UserHomeDir()
+	dir, err := StateDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".hub-cli.seed.yaml")
+	return filepath.Join(dir, "seed.yaml")
+}
+
+var migratedFiles []string
+
+// MigratedFiles lists the files moved into the state directory on this run, so
+// the caller can say what happened instead of leaving the user to notice.
+func MigratedFiles() []string { return migratedFiles }
+
+// migrateLegacyFiles moves config and seed from the scattered dotfiles they used
+// to live in into the state directory. It runs once: after the move the new
+// paths exist and the old ones are gone.
+func migrateLegacyFiles() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir, err := StateDir()
+	if err != nil {
+		return err
+	}
+
+	moves := []struct{ from, to string }{
+		{filepath.Join(home, ".hub-cli.yaml"), filepath.Join(dir, "config.yaml")},
+		{filepath.Join(home, ".hub-cli.seed.yaml"), filepath.Join(dir, "seed.yaml")},
+	}
+
+	for _, m := range moves {
+		if _, err := os.Stat(m.to); err == nil {
+			continue // already in place: never overwrite the current file
+		}
+		if _, err := os.Stat(m.from); err != nil {
+			continue // nothing to move
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("creazione di %s fallita: %w", dir, err)
+		}
+		if err := os.Rename(m.from, m.to); err != nil {
+			return fmt.Errorf("spostamento di %s fallito: %w", m.from, err)
+		}
+		migratedFiles = append(migratedFiles, fmt.Sprintf("%s → %s", m.from, m.to))
+	}
+	return nil
 }
 
 type GlobalConfig struct {
@@ -175,14 +236,21 @@ type Config struct {
 }
 
 func Init(customPath string) error {
+	if err := migrateLegacyFiles(); err != nil {
+		return err
+	}
+
 	if customPath != "" {
 		viper.SetConfigFile(customPath)
 	} else {
-		home, err := os.UserHomeDir()
+		path, err := ConfigFilePath()
 		if err != nil {
-			return fmt.Errorf("impossibile trovare la home directory: %w", err)
+			return err
 		}
-		viper.SetConfigFile(filepath.Join(home, ".hub-cli.yaml"))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("creazione della cartella di configurazione fallita: %w", err)
+		}
+		viper.SetConfigFile(path)
 	}
 
 	viper.SetDefault("config.ecr_region", "eu-west-1")
@@ -237,7 +305,7 @@ type seedFile struct {
 	PSN      map[string]any            `yaml:"psn"`
 }
 
-// loadSeedFromFile reads ~/.hub-cli.seed.yaml. Missing file is a valid state
+// loadSeedFromFile reads the seed file. A missing file is a valid state
 // and returns (nil, nil); a malformed file returns an error.
 func loadSeedFromFile() (*seedFile, error) {
 	path := SeedFilePath()
@@ -542,11 +610,17 @@ func GetHelmRootPath() string {
 // DefaultSyncBranch is used when the config declares no sync branch.
 const DefaultSyncBranch = "master"
 
+// GetHelmSyncBranch returns the chart branch used by the last run, empty when
+// there is none: the right branch depends on the site being worked on, so it is
+// chosen per run and this value only preselects the picker.
 func GetHelmSyncBranch() string {
-	if b := strings.TrimSpace(viper.GetString("config.helm_sync_branch")); b != "" {
-		return b
-	}
-	return DefaultSyncBranch
+	return strings.TrimSpace(viper.GetString("config.helm_sync_branch"))
+}
+
+// SetHelmSyncBranch remembers the branch chosen in this run.
+func SetHelmSyncBranch(branch string) error {
+	viper.Set("config.helm_sync_branch", branch)
+	return Save()
 }
 
 func GetDockerSyncBranch() string {

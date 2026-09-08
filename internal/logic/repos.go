@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -52,6 +53,32 @@ func GitRemoteURL(repoPath string) (string, error) {
 		return "", fmt.Errorf("il repository %s non ha un remote origin", repoPath)
 	}
 	return url, nil
+}
+
+// ListRemoteBranches returns the branches published on the remote, in
+// alphabetical order. It needs no clone, so it can run before one exists.
+func ListRemoteBranches(remoteURL string) ([]string, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("git", "ls-remote", "--heads", remoteURL)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, fmt.Errorf("lettura dei branch di %s fallita: %s", remoteURL, detail)
+	}
+
+	var branches []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if _, ref, ok := strings.Cut(strings.TrimSpace(line), "refs/heads/"); ok && ref != "" {
+			branches = append(branches, ref)
+		}
+	}
+	sort.Strings(branches)
+	return branches, nil
 }
 
 // normalizeRemoteURL reduces a remote URL to "host/path", dropping scheme,
@@ -184,7 +211,7 @@ func EnsureRepo(remoteURL, branch, reposRoot string, out io.Writer) (string, err
 	}
 
 	if !remoteBranchExists(dir, branch) {
-		return "", fmt.Errorf("il branch %q non esiste su origin (%s)", branch, remoteURL)
+		return "", fmt.Errorf("%w: %q non trovato su %s", ErrBranchNotFound, branch, remoteURL)
 	}
 	if err := runGit(dir, nil, "checkout", "-B", branch, "origin/"+branch); err != nil {
 		return "", err
@@ -192,6 +219,9 @@ func EnsureRepo(remoteURL, branch, reposRoot string, out io.Writer) (string, err
 
 	return dir, nil
 }
+
+// ErrBranchNotFound means the wanted branch is not published on the remote.
+var ErrBranchNotFound = errors.New("branch non presente su origin")
 
 // syncAttempts caps the realign → re-apply → push loop: three losses in a row
 // mean a branch too busy for an automatic sync.

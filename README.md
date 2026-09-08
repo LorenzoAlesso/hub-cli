@@ -18,7 +18,7 @@ Copy the executable to a folder in `PATH`:
 Copy-Item .\hub-cli.exe "$env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\hub-cli.exe"
 ```
 
-On first run, the config file is created at `~/.hub-cli.yaml`.
+On first run, the config file is created at `~/.hub-cli/config.yaml`. Everything hub-cli owns — config, seed and the managed clones — lives under `~/.hub-cli/`.
 
 ## Quick start
 
@@ -54,7 +54,7 @@ Copia l'eseguibile in una cartella nel `PATH`:
 Copy-Item .\hub-cli.exe "$env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\hub-cli.exe"
 ```
 
-Al primo avvio il file di configurazione viene creato automaticamente in `~/.hub-cli.yaml`.
+Al primo avvio il file di configurazione viene creato automaticamente in `~/.hub-cli/config.yaml`. Tutto ciò che appartiene a hub-cli — config, seed e cloni gestiti — vive sotto `~/.hub-cli/`.
 
 ## Utilizzo rapido
 

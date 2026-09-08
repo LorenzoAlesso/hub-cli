@@ -1,6 +1,7 @@
 package logic
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,14 +123,45 @@ func TestEnsureRepo(t *testing.T) {
 	}
 }
 
+func TestListRemoteBranches(t *testing.T) {
+	src := newSourceRepo(t)
+
+	branches, err := ListRemoteBranches(src)
+	if err != nil {
+		t.Fatalf("ls-remote: %v", err)
+	}
+
+	// newSourceRepo publishes master and coll, in alphabetical order.
+	want := []string{"coll", "master"}
+	if len(branches) != len(want) {
+		t.Fatalf("branch = %v, attesi %v", branches, want)
+	}
+	for i := range want {
+		if branches[i] != want[i] {
+			t.Errorf("branch[%d] = %q, atteso %q", i, branches[i], want[i])
+		}
+	}
+
+	if _, err := ListRemoteBranches(filepath.Join(t.TempDir(), "inesistente")); err == nil {
+		t.Error("remote inesistente: atteso errore")
+	}
+}
+
 func TestEnsureRepoErrors(t *testing.T) {
 	src := newSourceRepo(t)
 	root := t.TempDir()
 
+	// The sentinel lets PSN offer the branches the remote actually has instead
+	// of stopping on a declaration that no longer matches.
 	if _, err := EnsureRepo(src, "inesistente", root, nil); err == nil {
 		t.Error("branch inesistente: atteso errore")
-	} else if !strings.Contains(err.Error(), "inesistente") {
-		t.Errorf("messaggio poco chiaro: %v", err)
+	} else {
+		if !errors.Is(err, ErrBranchNotFound) {
+			t.Errorf("atteso ErrBranchNotFound, ottenuto %v", err)
+		}
+		if !strings.Contains(err.Error(), "inesistente") {
+			t.Errorf("messaggio poco chiaro: %v", err)
+		}
 	}
 
 	if _, err := EnsureRepo(src, "", root, nil); err == nil {

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ const (
 	psnNsLoading psnState = iota
 	psnNsSelect
 	psnRepoPrep
+	psnBranchSelect
 	psnDepLoading
 	psnDepSelect
 	psnTagInput
@@ -46,6 +48,11 @@ type psnOpDoneMsg struct {
 type psnRepoPrepDoneMsg struct {
 	dir string
 	err error
+}
+
+type psnBranchesLoadedMsg struct {
+	branches []string
+	err      error
 }
 
 type psnNsLoadedMsg struct {
@@ -82,13 +89,15 @@ type PSNWorkflowModel struct {
 
 	opStart time.Time
 
-	namespace    string
-	project      *config.PSNProjectConfig // per-namespace Dockerfile resolution override
-	projectDir   string                   // managed clone of the project repo, "" = working copy
-	scanRoot     string                   // root of a pending Dockerfile scan, set before psnDockerfileMissing
-	depByName    map[string]logic.DeploymentInfo
-	selectedDeps []string
-	depIdx       int
+	namespace     string
+	project       *config.PSNProjectConfig // per-namespace Dockerfile resolution override
+	projectDir    string                   // managed clone of the project repo, "" = working copy
+	projectURL    string                   // origin of the project repo
+	projectBranch string                   // branch the project clone is aligned to
+	scanRoot      string                   // root of a pending Dockerfile scan, set before psnDockerfileMissing
+	depByName     map[string]logic.DeploymentInfo
+	selectedDeps  []string
+	depIdx        int
 
 	dep            logic.DeploymentInfo
 	repo           string // registry + path, no tag
@@ -183,15 +192,29 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if rp, ok := msg.(psnRepoPrepDoneMsg); ok {
 		if rp.err != nil {
+			// The declared branch may have been renamed: offer what the remote
+			// actually publishes rather than failing outright.
+			if errors.Is(rp.err, logic.ErrBranchNotFound) {
+				m.log = append(m.log, WarnStyle.Render("  ⚠  "+rp.err.Error()))
+				return m.enterProjectBranchLoading()
+			}
 			m.log = append(m.log, ErrStyle.Render("  ✗  Allineamento del repo progetto non riuscito: "+rp.err.Error()))
 			m.cancelled = true
 			return m, tea.Quit
 		}
 		m.projectDir = rp.dir
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
-			"  Repo progetto allineato a origin/"+m.project.ExpectedBranch(m.cluster)+"  ")+
+			"  Repo progetto allineato a origin/"+m.projectBranch+"  ")+
 			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
 		return m.enterDepLoading()
+	}
+	if bl, ok := msg.(psnBranchesLoadedMsg); ok {
+		if bl.err != nil || len(bl.branches) == 0 {
+			m.log = append(m.log, ErrStyle.Render("  ✗  Nessun branch leggibile su "+m.projectURL))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		return m.enterProjectBranchSelect(bl.branches)
 	}
 	if done, ok := msg.(psnOpDoneMsg); ok {
 		return m.handleOpDone(done)
@@ -206,7 +229,7 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnNsSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
+	case psnNsSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -217,6 +240,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			case psnNsSelect:
 				return m.finishNsSelect()
+			case psnBranchSelect:
+				return m.finishProjectBranchSelect()
 			case psnDockerfileList:
 				return m.finishDockerfile()
 			case psnDockerfileMissing:
@@ -317,15 +342,55 @@ func (m PSNWorkflowModel) enterProjectRepoPrep(want string) (tea.Model, tea.Cmd)
 		m.cancelled = true
 		return m, tea.Quit
 	}
+	m.projectURL = remoteURL
+	return m.alignProjectRepo(want)
+}
 
+// alignProjectRepo aligns the managed clone to branch.
+func (m PSNWorkflowModel) alignProjectRepo(branch string) (tea.Model, tea.Cmd) {
+	m.projectBranch = branch
 	m.state = psnRepoPrep
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Allineamento repo progetto (" + want + ")")
+	m.spinner = newSpinnerModel("Allineamento repo progetto (" + branch + ")")
+	remoteURL := m.projectURL
 	reposRoot := config.GetReposRoot()
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		dir, err := logic.EnsureRepo(remoteURL, want, reposRoot, nil)
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
 		return psnRepoPrepDoneMsg{dir: dir, err: err}
 	})
+}
+
+// enterProjectBranchLoading runs only when the branch declared in the seed is
+// missing from the remote, so the run can continue on a branch that exists
+// instead of stopping on a stale configuration.
+func (m PSNWorkflowModel) enterProjectBranchLoading() (tea.Model, tea.Cmd) {
+	m.state = psnRepoPrep
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Lettura branch del progetto")
+	remoteURL := m.projectURL
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		branches, err := logic.ListRemoteBranches(remoteURL)
+		return psnBranchesLoadedMsg{branches: branches, err: err}
+	})
+}
+
+func (m PSNWorkflowModel) enterProjectBranchSelect(branches []string) (tea.Model, tea.Cmd) {
+	items := make([]Item, len(branches))
+	for i, b := range branches {
+		items[i] = Item{Value: b, Label: b}
+	}
+
+	m.state = psnBranchSelect
+	m.list = listModel{
+		title: "Branch del progetto Docker per " + m.cluster.Name,
+		items: items,
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m PSNWorkflowModel) finishProjectBranchSelect() (tea.Model, tea.Cmd) {
+	return m.alignProjectRepo(m.list.selected)
 }
 
 // projectRoot is the directory the build reads from: the managed clone when the
@@ -851,7 +916,7 @@ func (m PSNWorkflowModel) View() tea.View {
 	case psnNsLoading, psnRepoPrep, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinner.spinner.View(), elapsed))
-	case psnNsSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
+	case psnNsSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
 		sb.WriteString(m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString(m.multisel.View().Content)

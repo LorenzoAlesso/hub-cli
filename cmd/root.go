@@ -32,6 +32,9 @@ var rootCmd = &cobra.Command{
 		if err == nil {
 			ui.InitTheme(cfg.Config.Theme)
 		}
+		for _, moved := range config.MigratedFiles() {
+			ui.PrintOK("Spostato: " + moved)
+		}
 		if config.WasSeeded() {
 			if config.SeededFromFile() {
 				ui.PrintWarn("Configurazione creata dal seed file. Imposta i percorsi con 'hub-cli config set-root'.")
@@ -100,7 +103,7 @@ func isInterrupt(err error) bool {
 func init() {
 	cobra.OnInitialize(initConfig)
 
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "file di configurazione custom (default: ~/.hub-cli.yaml)")
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "file di configurazione custom (default: ~/.hub-cli/config.yaml)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "output dettagliato dei comandi")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "mostra i comandi senza eseguirli")
 	rootCmd.PersistentFlags().BoolVar(&testUI, "test-ui", false, "simula il deploy con spinner reali ma senza eseguire nulla")

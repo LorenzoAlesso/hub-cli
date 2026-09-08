@@ -27,10 +27,16 @@ var configShowCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println(ui.SectionStyle.Render("Configurazione Globale"))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("File:           "), ui.ValueStyle.Render(config.GetFilePath()))
+		reposRoot, _ := logic.ResolveReposRoot(cfg.Config.ReposRoot)
+
+		fmt.Println(ui.SectionStyle.Render("Percorsi"))
+		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Config:         "), ui.ValueStyle.Render(config.GetFilePath()))
+		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Seed:           "), orNA(config.SeedFilePath()))
+		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Repo gestiti:   "), orNA(reposRoot))
 		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Docker Root:    "), orNA(cfg.Config.DockerRootPath))
 		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Helm Root:      "), orNA(cfg.Config.HelmRootPath))
+
+		fmt.Println(ui.SectionStyle.Render("Configurazione Globale"))
 		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("ECR Region:     "), ui.ValueStyle.Render(cfg.Config.ECRRegion))
 		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("ECR Account:    "), ui.ValueStyle.Render(cfg.Config.ECRAccountID))
 		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Chart Version:  "), ui.ValueStyle.Render(cfg.Config.ChartVersion))
@@ -39,6 +45,7 @@ var configShowCmd = &cobra.Command{
 			themeVal = "auto"
 		}
 		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Tema:           "), ui.ValueStyle.Render(themeVal))
+		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Branch chart:   "), orNA(config.GetHelmSyncBranch()))
 
 		if len(cfg.Services) == 0 {
 			fmt.Println(ui.WarnStyle.Render("\nNessun servizio configurato."))

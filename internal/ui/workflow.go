@@ -21,6 +21,8 @@ type wfState int
 
 const (
 	wfECRLogin wfState = iota
+	wfBranchLoading
+	wfBranchSelect
 	wfRepoPrep
 	wfServiceSelect
 	wfSvcTagSync
@@ -42,6 +44,11 @@ const (
 type wfOpDoneMsg struct {
 	err    error
 	output []byte
+}
+
+type wfBranchesLoadedMsg struct {
+	branches []string
+	err      error
 }
 
 type wfRepoPrepDoneMsg struct {
@@ -93,10 +100,12 @@ type WorkflowModel struct {
 	valuesPath     string
 	chartVersion   string
 
-	localValues bool              // values from the working copy: test deploy, sync skipped
-	helmRepoDir string            // managed clone the values are read from, "" = working copy
-	deployed    []deployedService // services that reached the cluster, for the final commit
-	syncErr     error
+	localValues   bool              // values from the working copy: test deploy, sync skipped
+	helmRemoteURL string            // origin of the charts repo, read from the working copy
+	helmBranch    string            // chart branch chosen for this run
+	helmRepoDir   string            // managed clone the values are read from, "" = working copy
+	deployed      []deployedService // services that reached the cluster, for the final commit
+	syncErr       error
 
 	results []DeployResult
 }
@@ -182,6 +191,16 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if done, ok := msg.(wfOpDoneMsg); ok {
 		return m.handleOpDone(done)
 	}
+	if bl, ok := msg.(wfBranchesLoadedMsg); ok {
+		if bl.err != nil {
+			m.log = append(m.log, ErrStyle.Render("  ✗  "+bl.err.Error()))
+			m.log = append(m.log, DimStyle.Render(
+				"      Per usare i values della copia di lavoro: hub-cli local --local-values"))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		return m.enterBranchSelect(bl.branches)
+	}
 	if rp, ok := msg.(wfRepoPrepDoneMsg); ok {
 		if rp.err != nil {
 			// A stale or wrong-branch values file would silently revert
@@ -194,7 +213,7 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.helmRepoDir = rp.dir
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
-			"  Repo charts allineato a origin/"+config.GetHelmSyncBranch()+"  ")+
+			"  Values da origin/"+m.helmBranch+"  ")+
 			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
 		return m.enterServiceSelect()
 	}
@@ -208,7 +227,8 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfRepoPrep, wfPostSync:
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback,
+		wfBranchLoading, wfRepoPrep, wfPostSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
@@ -237,7 +257,7 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
+	case wfBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -246,6 +266,8 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.list.done {
 			switch m.state {
+			case wfBranchSelect:
+				return m.finishBranchSelect()
 			case wfSvcDockerfile:
 				return m.finishDockerfile()
 			case wfSvcDockerfileMissing:
@@ -312,7 +334,7 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 				"aws ecr get-login-password --region %s | docker login --username AWS %s.dkr.ecr.%s.amazonaws.com",
 				m.cfg.Config.ECRRegion, m.cfg.Config.ECRAccountID, m.cfg.Config.ECRRegion)))
 		}
-		return m.enterRepoPrep()
+		return m.enterBranchLoading()
 
 	case wfSvcBuilding:
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Build  ")+ValueStyle.Render(elapsed))
@@ -339,12 +361,12 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── Managed repo prep ─────────────────────────────────────────────────────────
+// ── Chart branch and managed repo prep ────────────────────────────────────────
 
-// enterRepoPrep realigns the managed clone of the charts repo before anything is
-// deployed: the values file passed to `helm -f` is applied to the cluster, so it
-// must come from a known, freshly fetched state.
-func (m WorkflowModel) enterRepoPrep() (tea.Model, tea.Cmd) {
+// enterBranchLoading reads the branches published on the charts remote. Which
+// one holds the right values depends on the site being worked on, so it is a
+// per-run choice rather than a setting.
+func (m WorkflowModel) enterBranchLoading() (tea.Model, tea.Cmd) {
 	helmRoot := m.cfg.Config.HelmRootPath
 
 	switch {
@@ -354,7 +376,7 @@ func (m WorkflowModel) enterRepoPrep() (tea.Model, tea.Cmd) {
 		return m.enterServiceSelect()
 	case m.dryRun || m.testUI:
 		if m.dryRun {
-			m.log = append(m.log, wfDryRunLine("git fetch + checkout del repo charts su "+config.GetHelmSyncBranch()))
+			m.log = append(m.log, wfDryRunLine("selezione del branch chart e allineamento del repo gestito"))
 		}
 		return m.enterServiceSelect()
 	case helmRoot == "":
@@ -363,13 +385,83 @@ func (m WorkflowModel) enterRepoPrep() (tea.Model, tea.Cmd) {
 
 	remoteURL, err := logic.GitRemoteURL(helmRoot)
 	if err != nil {
-		return m, func() tea.Msg { return wfRepoPrepDoneMsg{err: err} }
+		return m, func() tea.Msg { return wfBranchesLoadedMsg{err: err} }
+	}
+	m.helmRemoteURL = remoteURL
+
+	m.state = wfBranchLoading
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Lettura branch dei chart")
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		branches, err := logic.ListRemoteBranches(remoteURL)
+		return wfBranchesLoadedMsg{branches: branches, err: err}
+	})
+}
+
+// enterBranchSelect asks which branch the values come from, preselecting the one
+// used last so the common case stays a single Enter.
+func (m WorkflowModel) enterBranchSelect(branches []string) (tea.Model, tea.Cmd) {
+	if len(branches) == 0 {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Nessun branch pubblicato su "+m.helmRemoteURL))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	if len(branches) == 1 {
+		return m.enterRepoPrep(branches[0])
+	}
+
+	workingCopy, _ := logic.GitCurrentBranch(m.cfg.Config.HelmRootPath)
+	items := make([]Item, len(branches))
+	for i, b := range branches {
+		items[i] = Item{Value: b, Label: b}
+		if b == workingCopy {
+			items[i].Desc = "branch della copia di lavoro"
+		}
+	}
+
+	m.state = wfBranchSelect
+	m.list = listModel{
+		title:  "Branch dei chart da cui leggere i values",
+		items:  items,
+		cursor: wfDefaultBranchIndex(branches, config.GetHelmSyncBranch(), workingCopy),
+		width:  m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishBranchSelect() (tea.Model, tea.Cmd) {
+	return m.enterRepoPrep(m.list.selected)
+}
+
+// wfDefaultBranchIndex preselects the branch used last, falling back to the one
+// the working copy is on.
+func wfDefaultBranchIndex(branches []string, lastUsed, workingCopy string) int {
+	for _, want := range []string{lastUsed, workingCopy} {
+		if want == "" {
+			continue
+		}
+		for i, b := range branches {
+			if b == want {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+// enterRepoPrep realigns the managed clone to the chosen branch before anything
+// is deployed: the values file passed to `helm -f` is applied to the cluster, so
+// it must come from a known, freshly fetched state.
+func (m WorkflowModel) enterRepoPrep(branch string) (tea.Model, tea.Cmd) {
+	m.helmBranch = branch
+	if err := config.SetHelmSyncBranch(branch); err != nil {
+		m.log = append(m.log, WarnStyle.Render("  ⚠  Branch scelto non salvato: "+err.Error()))
 	}
 
 	m.state = wfRepoPrep
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Allineamento repo charts")
-	branch := config.GetHelmSyncBranch()
+	m.spinner = newSpinnerModel("Allineamento repo chart (" + branch + ")")
+	remoteURL := m.helmRemoteURL
 	reposRoot := config.GetReposRoot()
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
 		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
@@ -827,8 +919,9 @@ func (m WorkflowModel) enterPostSync() (tea.Model, tea.Cmd) {
 	m.spinner = newSpinnerModel("Sync repo")
 	cfg := m.cfg
 	deployed := m.deployed
+	helmBranch := m.helmBranch
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		lines, err := wfRunPostDeploySync(cfg, deployed)
+		lines, err := wfRunPostDeploySync(cfg, deployed, helmBranch)
 		return wfPostSyncDoneMsg{lines: lines, err: err}
 	})
 }
@@ -860,14 +953,15 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfRepoPrep, wfPostSync:
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback,
+		wfBranchLoading, wfRepoPrep, wfPostSync:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinnerFrame(), elapsed))
 	case wfServiceSelect:
 		sb.WriteString(m.multisel.View().Content)
 	case wfSvcTagSync:
 		sb.WriteString(m.confirm.View().Content)
-	case wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
+	case wfBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
 		sb.WriteString(m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
 		sb.WriteString(m.input.View().Content)
@@ -1063,7 +1157,7 @@ func wfSortedServiceKeys(m map[string]config.ServiceConfig) []string {
 // wfRunPostDeploySync writes the deployed tags back to the repositories, one
 // commit per repository. A failure is reported, never swallowed: the branch
 // everybody deploys from would no longer match the cluster.
-func wfRunPostDeploySync(cfg *config.Config, deployed []deployedService) ([]string, error) {
+func wfRunPostDeploySync(cfg *config.Config, deployed []deployedService, helmBranch string) ([]string, error) {
 	var lines []string
 	var failures []error
 
@@ -1072,7 +1166,7 @@ func wfRunPostDeploySync(cfg *config.Config, deployed []deployedService) ([]stri
 
 	if targets := wfHelmTargets(deployed); len(targets) > 0 && cfg.Config.HelmRootPath != "" {
 		ls, err := wfSyncRepo(
-			cfg.Config.HelmRootPath, config.GetHelmSyncBranch(), reposRoot, message, "charts",
+			cfg.Config.HelmRootPath, helmBranch, reposRoot, message, "chart",
 			func(dir string) ([]string, error) {
 				var changed []string
 				for _, d := range targets {

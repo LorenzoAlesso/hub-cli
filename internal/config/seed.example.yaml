@@ -1,19 +1,19 @@
 # Template seed.yaml per hub-cli.
 #
 # Uso:
-#   1. Copia questo file in ~/.hub-cli.seed.yaml
+#   1. Copia questo file in ~/.hub-cli/seed.yaml
 #   2. Personalizza i valori per i tuoi servizi
 #   3. Rilancia un qualsiasi comando hub-cli per importarli nel config utente
 #
-# NOTA: il file ~/.hub-cli.seed.yaml NON va committato — contiene dati
+# NOTA: il file ~/.hub-cli/seed.yaml NON va committato — contiene dati
 # specifici dell'ambiente (registry, namespace, release name, ecc.).
 #
-# Formato: stessa struttura di ~/.hub-cli.yaml (sezioni `config` e `services`).
+# Formato: stessa struttura di ~/.hub-cli/config.yaml (sezioni `config` e `services`).
 # Ogni servizio ha campi obbligatori (ecr_repository, helm_set_key)
 # e campi opzionali documentati di seguito.
 
 # ── Configurazione globale (opzionale) ──────────────────────────────────
-# Applicata solo al primo avvio, quando ~/.hub-cli.yaml non esiste ancora.
+# Applicata solo al primo avvio, quando ~/.hub-cli/config.yaml non esiste ancora.
 # Se una chiave è assente, vale il default interno.
 config:
   # Account ID AWS del registry ECR (12 cifre)
@@ -40,9 +40,9 @@ config:
   # i Dockerfile della build. Gli URL non si configurano: si ricavano dal
   # remote origin di helm_root_path / docker_root_path.
 
-  # Branch del repo dei chart da cui si legge il values e su cui atterra il
-  # commit del tag. Default: master.
-  # helm_sync_branch: master
+  # Ultimo branch chart usato. Il branch viene chiesto a ogni run, leggendo
+  # quelli pubblicati sul remote: questo valore serve solo a preselezionarlo.
+  # helm_sync_branch: dev
 
   # Branch del repo Docker per il sync di k8s_manifest_path. Default: master.
   # docker_sync_branch: master
@@ -124,9 +124,10 @@ services:
 #   # matchano il pattern, i Dockerfile si risolvono dentro docker_root
 #   # (mapping esplicito → convenzione <deployment>/Dockerfile → scansione)
 #   # invece che nel docker_root_path globale. branch_coll/branch_prod:
-#   # branch git su cui il repo deve trovarsi per quell'ambiente — verificato
-#   # prima della build, con proposta di checkout (bloccato se il repo ha
-#   # modifiche non committate).
+#   # branch da cui buildare per quell'ambiente — il clone gestito ci viene
+#   # allineato prima della build, senza toccare la tua copia di lavoro. Se il
+#   # branch dichiarato non esiste più sul remote, vengono proposti quelli
+#   # disponibili invece di interrompere il deploy.
 #   projects:
 #     - namespace: "legacy-*"
 #       docker_root: C:/dev/legacy-project/docker-images
