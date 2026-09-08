@@ -41,39 +41,110 @@ type listModel struct {
 	done     bool
 	quit     bool
 	width    int
+	filter   string
 }
 
+// listWindow caps how many entries are drawn at once. Some lists are long — a
+// repo can publish dozens of branches — and a box taller than the terminal
+// scrolls the frame away instead of showing it.
+const listWindow = 12
+
 func (m listModel) Init() tea.Cmd { return nil }
+
+// matches returns the entries left after the filter, and is the list the cursor
+// indexes into.
+func (m listModel) matches() []Item {
+	if m.filter == "" {
+		return m.items
+	}
+	needle := strings.ToLower(m.filter)
+	var out []Item
+	for _, item := range m.items {
+		if strings.Contains(strings.ToLower(item.Label), needle) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
 
 func (m listModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "esc":
+		key := msg.String()
+		switch key {
+		case "ctrl+c":
 			m.quit = true
 			return m, tea.Quit
-		case "up", "k":
+		case "esc":
+			// Clear the filter first: escaping a typo should not throw away
+			// the whole selection.
+			if m.filter != "" {
+				m.filter = ""
+				m.cursor = 0
+				return m, nil
+			}
+			m.quit = true
+			return m, tea.Quit
+		case "up":
 			if m.cursor > 0 {
 				m.cursor--
 			}
-		case "down", "j":
-			if m.cursor < len(m.items)-1 {
+		case "down":
+			if m.cursor < len(m.matches())-1 {
 				m.cursor++
 			}
-		case "enter", " ":
-			m.selected = m.items[m.cursor].Value
+		case "backspace":
+			if m.filter != "" {
+				m.filter = m.filter[:len(m.filter)-1]
+				m.cursor = 0
+			}
+		case "enter":
+			visible := m.matches()
+			if len(visible) == 0 {
+				return m, nil
+			}
+			m.selected = visible[m.cursor].Value
 			m.done = true
 			return m, tea.Quit
+		default:
+			// Anything printable narrows the list. Long lists are unusable
+			// otherwise, and typing is faster than scrolling on short ones too.
+			if r := []rune(key); len(r) == 1 && r[0] >= ' ' {
+				m.filter += key
+				m.cursor = 0
+			}
 		}
 	}
 	return m, nil
 }
 
+// listSlice returns the window of entries to draw around the cursor, plus how
+// many are hidden above and below.
+func listSlice(count, cursor int) (start, end, above, below int) {
+	if count <= listWindow {
+		return 0, count, 0, 0
+	}
+	start = cursor - listWindow/2
+	if start < 0 {
+		start = 0
+	}
+	if start+listWindow > count {
+		start = count - listWindow
+	}
+	end = start + listWindow
+	return start, end, start, count - end
+}
+
 func (m listModel) View() tea.View {
+	visible := m.matches()
+
 	if m.done {
-		label := m.items[m.cursor].Label
+		label := ""
+		if m.cursor < len(visible) {
+			label = visible[m.cursor].Label
+		}
 		return tea.NewView(fmt.Sprintf("  %s %s %s\n",
 			LabelStyle.Render(m.title+":"),
 			CursorStyle.Render("▸"),
@@ -81,19 +152,34 @@ func (m listModel) View() tea.View {
 		))
 	}
 
+	title := TitleStyle.Render(m.title)
+	if m.filter != "" {
+		title += DimStyle.Render(fmt.Sprintf("  (filtro: %s — %d di %d)",
+			m.filter, len(visible), len(m.items)))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(title + "\n\n")
+
+	if len(visible) == 0 {
+		sb.WriteString(BoxStyle.Render(WarnStyle.Render("nessuna voce per " + m.filter)))
+		sb.WriteString("\n" + HelpStyle.Render("digita per filtrare · backspace cancella · esc azzera il filtro"))
+		return tea.NewView(sb.String())
+	}
+
+	start, end, above, below := listSlice(len(visible), m.cursor)
+	window := visible[start:end]
+
 	// Compute the label column width so descriptions line up.
 	maxLen := 0
-	for _, item := range m.items {
+	for _, item := range window {
 		if len(item.Label) > maxLen {
 			maxLen = len(item.Label)
 		}
 	}
 
-	var sb strings.Builder
-	sb.WriteString(TitleStyle.Render(m.title) + "\n\n")
-
-	lines := make([]string, len(m.items))
-	for i, item := range m.items {
+	lines := make([]string, len(window))
+	for i, item := range window {
 		padding := strings.Repeat(" ", maxLen-len(item.Label)+2)
 		var desc string
 		if item.Desc != "" {
@@ -101,16 +187,23 @@ func (m listModel) View() tea.View {
 		}
 
 		cur := " "
-		if i == m.cursor {
+		if start+i == m.cursor {
 			cur = CursorStyle.Render(">")
 		}
 
 		label := ItemStyle.Render(item.Label)
-		if i == m.cursor {
+		if start+i == m.cursor {
 			label = SelectedItemStyle.Render(item.Label)
 		}
 
 		lines[i] = fmt.Sprintf("  %s %s%s%s", cur, label, padding, desc)
+	}
+
+	if above > 0 {
+		lines = append([]string{DimStyle.Render(fmt.Sprintf("    ↑ altre %d", above))}, lines...)
+	}
+	if below > 0 {
+		lines = append(lines, DimStyle.Render(fmt.Sprintf("    ↓ altre %d", below)))
 	}
 
 	// Normalize all line widths so the box border never shifts on hover.
@@ -127,7 +220,7 @@ func (m listModel) View() tea.View {
 	}
 
 	sb.WriteString(BoxStyle.Render(strings.Join(lines, "\n")))
-	sb.WriteString("\n" + HelpStyle.Render("↑/↓ naviga · enter seleziona · esc annulla"))
+	sb.WriteString("\n" + HelpStyle.Render("↑/↓ naviga · digita per filtrare · enter seleziona · esc annulla"))
 	w := m.width
 	if w == 0 {
 		w = 80

@@ -47,7 +47,7 @@ func runLocalWorkflow() error {
 		return fmt.Errorf("--dry-run e --test-ui non possono essere usati insieme")
 	}
 
-	results, cancelled, syncErr, err := ui.RunWorkflow(cfg, dryRun, testUI, localValues)
+	results, cancelled, syncErr, err := ui.RunWorkflow(cfg, dryRun, testUI, localSources)
 	if err != nil {
 		return err
 	}

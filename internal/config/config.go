@@ -607,9 +607,6 @@ func GetHelmRootPath() string {
 	return viper.GetString("config.helm_root_path")
 }
 
-// DefaultSyncBranch is used when the config declares no sync branch.
-const DefaultSyncBranch = "master"
-
 // GetHelmSyncBranch returns the chart branch used by the last run, empty when
 // there is none: the right branch depends on the site being worked on, so it is
 // chosen per run and this value only preselects the picker.
@@ -623,11 +620,17 @@ func SetHelmSyncBranch(branch string) error {
 	return Save()
 }
 
-func GetDockerSyncBranch() string {
-	if b := strings.TrimSpace(viper.GetString("config.docker_sync_branch")); b != "" {
-		return b
-	}
-	return DefaultSyncBranch
+// GetDockerBranch returns the Docker branch used by the last run, empty when
+// there is none: like the chart branch it is chosen per run and this value only
+// preselects the picker.
+func GetDockerBranch() string {
+	return strings.TrimSpace(viper.GetString("config.docker_sync_branch"))
+}
+
+// SetDockerBranch remembers the Docker branch chosen in this run.
+func SetDockerBranch(branch string) error {
+	viper.Set("config.docker_sync_branch", branch)
+	return Save()
 }
 
 func GetReposRoot() string {

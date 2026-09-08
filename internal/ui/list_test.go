@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,21 +63,68 @@ func TestDockerfileListStaysNarrow(t *testing.T) {
 		width:  120,
 	}
 
-	var widths []int
-	for _, line := range strings.Split(m.View().Content, "\n") {
-		if w := lipgloss.Width(line); w > 0 {
-			widths = append(widths, w)
-		}
-	}
-
+	// Only the box matters here: the help line below it has a fixed width of
+	// its own and says nothing about the labels.
 	maxWidth := 0
-	for _, w := range widths {
-		if w > maxWidth {
-			maxWidth = w
+	for _, line := range strings.Split(m.View().Content, "\n") {
+		trimmed := strings.TrimSpace(stripANSI(line))
+		if trimmed == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "╭"), strings.HasPrefix(trimmed, "╰"), strings.HasPrefix(trimmed, "│"):
+			if w := lipgloss.Width(line); w > maxWidth {
+				maxWidth = w
+			}
 		}
 	}
 	if maxWidth > 45 {
-		t.Errorf("lista larga %d colonne: le etichette non sono più relative alla root", maxWidth)
+		t.Errorf("box largo %d colonne: le etichette non sono più relative alla root", maxWidth)
+	}
+}
+
+// A list longer than the window must not draw every entry: a box taller than
+// the terminal scrolls the frame away instead of showing it.
+func TestLongListIsWindowed(t *testing.T) {
+	items := make([]Item, 40)
+	for i := range items {
+		items[i] = Item{Value: fmt.Sprint(i), Label: fmt.Sprintf("branch-%02d", i)}
+	}
+	m := listModel{title: "Branch", items: items, cursor: 0, width: 120}
+
+	rows := 0
+	for _, line := range strings.Split(m.View().Content, "\n") {
+		if trimmed := strings.TrimSpace(stripANSI(line)); strings.HasPrefix(trimmed, "│") {
+			rows++
+		}
+	}
+	if rows > listWindow+2 { // window plus the two "altre N" hints
+		t.Errorf("righe disegnate = %d, la finestra è di %d", rows, listWindow)
+	}
+}
+
+// Typing narrows the list, which is the only way 57 branches stay usable.
+func TestFilterNarrowsTheList(t *testing.T) {
+	m := listModel{items: []Item{
+		{Value: "a", Label: "site-a-pre-prod"},
+		{Value: "b", Label: "site-a-prod"},
+		{Value: "c", Label: "site-c-pre-prod"},
+		{Value: "d", Label: "master"},
+	}}
+
+	m.filter = "site-a"
+	if got := len(m.matches()); got != 2 {
+		t.Errorf("voci filtrate = %d, attese 2", got)
+	}
+
+	m.filter = "PROD" // case-insensitive
+	if got := len(m.matches()); got != 3 {
+		t.Errorf("filtro case-insensitive: voci = %d, attese 3", got)
+	}
+
+	m.filter = "nulla"
+	if got := len(m.matches()); got != 0 {
+		t.Errorf("filtro senza riscontri: voci = %d, attese 0", got)
 	}
 }
 

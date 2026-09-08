@@ -14,11 +14,11 @@ import (
 var errCancelled = errors.New("annullato")
 
 var (
-	cfgFile     string
-	verbose     bool
-	dryRun      bool
-	testUI      bool
-	localValues bool // values from the working copy: test deploy, sync skipped
+	cfgFile      string
+	verbose      bool
+	dryRun       bool
+	testUI       bool
+	localSources bool // values from the working copy: test deploy, sync skipped
 )
 
 var rootCmd = &cobra.Command{
@@ -107,7 +107,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "output dettagliato dei comandi")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "mostra i comandi senza eseguirli")
 	rootCmd.PersistentFlags().BoolVar(&testUI, "test-ui", false, "simula il deploy con spinner reali ma senza eseguire nulla")
-	rootCmd.PersistentFlags().BoolVar(&localValues, "local-values", false, "deploy di prova: usa i values della copia di lavoro e salta il sync (solo workflow locale)")
+	rootCmd.PersistentFlags().BoolVar(&localSources, "local-sources", false, "deploy di prova: usa values e Dockerfile dalle copie di lavoro e salta il sync (solo workflow locale)")
 
 	rootCmd.AddCommand(localCmd)
 	rootCmd.AddCommand(psnCmd)
