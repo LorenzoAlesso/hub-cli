@@ -19,11 +19,10 @@ import (
 type psnState int
 
 const (
-	psnNsLoading psnState = iota
-	psnNsSelect
+	psnReleaseSelect psnState = iota
+	psnChartsPrep
 	psnRepoPrep
 	psnBranchSelect
-	psnDepLoading
 	psnDepSelect
 	psnTagInput
 	psnDockerfileList
@@ -31,10 +30,9 @@ const (
 	psnBuildArg
 	psnBuilding
 	psnPushing
-	psnSettingImage
-	psnRollingOut
+	psnHelmDeploy
 	psnDeployError
-	psnRollback
+	psnSync
 	psnSummary
 )
 
@@ -55,21 +53,25 @@ type psnBranchesLoadedMsg struct {
 	err      error
 }
 
-type psnNsLoadedMsg struct {
-	namespaces []string
-	err        error
+// psnStartMsg kicks the workflow off from Update, which can mutate the model —
+// Init cannot.
+type psnStartMsg struct{}
+
+type psnChartsPrepDoneMsg struct {
+	dir string
+	err error
 }
 
-type psnDepLoadedMsg struct {
-	deployments []logic.DeploymentInfo
-	err         error
+type psnSyncDoneMsg struct {
+	lines []string
+	err   error
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
-// PSNWorkflowModel drives the PSN deploy pipeline. Unlike the local workflow,
-// services are discovered live from the cluster (namespace → deployments) and
-// the deploy is kubectl-based (set image + rollout), with no Helm involved.
+// PSNWorkflowModel drives the PSN deploy pipeline. PSN is deployed with Helm,
+// so the chart values file — not the cluster — lists what can be deployed, where
+// each image is pushed and which tag is live.
 type PSNWorkflowModel struct {
 	cfg     *config.Config
 	cluster config.PSNClusterConfig
@@ -89,17 +91,21 @@ type PSNWorkflowModel struct {
 
 	opStart time.Time
 
+	release   config.PSNReleaseConfig
+	chartsDir string           // managed clone of the charts repo
+	values    logic.HelmValues // what the release values declare
+
 	namespace     string
 	project       *config.PSNProjectConfig // per-namespace Dockerfile resolution override
 	projectDir    string                   // managed clone of the project repo, "" = working copy
 	projectURL    string                   // origin of the project repo
 	projectBranch string                   // branch the project clone is aligned to
 	scanRoot      string                   // root of a pending Dockerfile scan, set before psnDockerfileMissing
-	depByName     map[string]logic.DeploymentInfo
+	svcByName     map[string]logic.HelmService
 	selectedDeps  []string
 	depIdx        int
 
-	dep            logic.DeploymentInfo
+	svc            logic.HelmService
 	repo           string // registry + path, no tag
 	oldTag         string
 	newTag         string
@@ -108,10 +114,21 @@ type PSNWorkflowModel struct {
 	buildArgs      map[string]string
 	buildArgQueue  []logic.DockerArg
 	buildArgIdx    int
-	imageApplied   bool // set image succeeded: rollback must also undo the rollout
 	depStart       time.Time
 
+	// deployed collects what has been built and pushed, for the single helm
+	// upgrade at the end and for the sync that writes the tags back.
+	deployed []psnDeployed
+	syncErr  error
+
 	results []DeployResult
+}
+
+// psnDeployed is one image built and pushed in this run.
+type psnDeployed struct {
+	svc    logic.HelmService
+	oldTag string
+	newTag string
 }
 
 // RunPSNWorkflow runs the PSN deploy pipeline as a single persistent BubbleTea
@@ -128,8 +145,7 @@ func RunPSNWorkflow(cfg *config.Config, cluster config.PSNClusterConfig, dryRun,
 		cluster: cluster,
 		dryRun:  dryRun,
 		testUI:  testUI,
-		state:   psnNsLoading,
-		spinner: newSpinnerModel("Lettura namespace"),
+		state:   psnReleaseSelect,
 		opStart: time.Now(),
 	}
 	p := tea.NewProgram(m)
@@ -142,35 +158,23 @@ func RunPSNWorkflow(cfg *config.Config, cluster config.PSNClusterConfig, dryRun,
 	return wf.results, wf.cancelled, nil
 }
 
-// In dry-run/test-ui the kube context is not pointed at the PSN cluster, so
-// discovery runs on placeholder data.
-func psnFakeNamespaces() []string {
-	return []string{"demo-ns-col", "demo-ns2-col"}
-}
-
-func psnFakeDeployments() []logic.DeploymentInfo {
-	return []logic.DeploymentInfo{
-		{Name: "webapp", Container: "webapp", Image: "demoacr.azurecr.io/demo/webapp:1.0.0", Containers: 1},
-		{Name: "jboss-fe", Container: "jboss-fe", Image: "demoacr.azurecr.io/demo/jboss-fe:2.1.3", Containers: 1},
+// In test-ui nothing is read for real, so the services come from placeholders.
+func psnFakeValues() logic.HelmValues {
+	return logic.HelmValues{
+		Namespace: "demo-ns-col",
+		Services: []logic.HelmService{
+			{Name: "webapp", Repository: "demoacr.azurecr.io/demo/webapp", Tag: "1.0.0",
+				Keys: []logic.HelmImageKey{{Key: "webapp", SetKey: "webapp.image.tag"}}},
+			{Name: "jboss-fe", Repository: "demoacr.azurecr.io/demo/jboss-fe", Tag: "2.1.3",
+				Keys: []logic.HelmImageKey{{Key: "jbossFe", SetKey: "jbossFe.image.tag"}}},
+		},
 	}
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 func (m PSNWorkflowModel) Init() tea.Cmd {
-	dryRun := m.dryRun
-	testUI := m.testUI
-	return tea.Batch(m.spinner.Init(), func() tea.Msg {
-		if testUI {
-			time.Sleep(600 * time.Millisecond)
-			return psnNsLoadedMsg{namespaces: psnFakeNamespaces()}
-		}
-		if dryRun {
-			return psnNsLoadedMsg{namespaces: psnFakeNamespaces()}
-		}
-		ns, err := logic.ListAppNamespaces()
-		return psnNsLoadedMsg{namespaces: ns, err: err}
-	})
+	return func() tea.Msg { return psnStartMsg{} }
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -184,11 +188,17 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = wm.Width
 		return m, nil
 	}
-	if ns, ok := msg.(psnNsLoadedMsg); ok {
-		return m.handleNsLoaded(ns)
+	if _, ok := msg.(psnStartMsg); ok {
+		return m.start()
 	}
-	if dep, ok := msg.(psnDepLoadedMsg); ok {
-		return m.handleDepLoaded(dep)
+	if cp, ok := msg.(psnChartsPrepDoneMsg); ok {
+		return m.handleChartsPrepDone(cp)
+	}
+	if sy, ok := msg.(psnSyncDoneMsg); ok {
+		m.log = append(m.log, sy.lines...)
+		m.syncErr = sy.err
+		m.state = psnSummary
+		return m, tea.Quit
 	}
 	if rp, ok := msg.(psnRepoPrepDoneMsg); ok {
 		if rp.err != nil {
@@ -206,7 +216,7 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
 			"  Repo progetto allineato a origin/"+m.projectBranch+"  ")+
 			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
-		return m.enterDepLoading()
+		return m.enterDepSelect()
 	}
 	if bl, ok := msg.(psnBranchesLoadedMsg); ok {
 		if bl.err != nil || len(bl.branches) == 0 {
@@ -224,12 +234,12 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case psnNsLoading, psnRepoPrep, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
+	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnNsSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
+	case psnReleaseSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -238,8 +248,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.list.done {
 			switch m.state {
-			case psnNsSelect:
-				return m.finishNsSelect()
+			case psnReleaseSelect:
+				return m.finishReleaseSelect()
 			case psnBranchSelect:
 				return m.finishProjectBranchSelect()
 			case psnDockerfileList:
@@ -282,44 +292,125 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── Namespace selection ───────────────────────────────────────────────────────
+// ── Release selection ─────────────────────────────────────────────────────────
 
-func (m PSNWorkflowModel) handleNsLoaded(msg psnNsLoadedMsg) (tea.Model, tea.Cmd) {
-	if msg.err != nil {
-		m.log = append(m.log, ErrStyle.Render("  ✗  Lettura namespace fallita: "+msg.err.Error()))
+// start picks the release to deploy. A cluster hosts more than one, so with
+// several configured the choice is explicit; with one it is implicit.
+func (m PSNWorkflowModel) start() (tea.Model, tea.Cmd) {
+	releases := m.cluster.Releases
+	if len(releases) == 0 {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Nessun release configurato per "+m.cluster.Name))
+		m.log = append(m.log, DimStyle.Render(
+			"      Aggiungere il blocco releases al cluster nel seed (vedi internal/config/seed.example.yaml)."))
+		m.cancelled = true
 		return m, tea.Quit
 	}
-	if len(msg.namespaces) == 0 {
-		m.log = append(m.log, ErrStyle.Render("  ✗  Nessun namespace applicativo trovato sul cluster"))
-		return m, tea.Quit
-	}
-	if m.dryRun {
-		m.log = append(m.log, SecondaryStyle.Render("  ◆ DRY-RUN")+"  "+
-			DimStyle.Render("contesto cluster non agganciato: namespace e deployment sono simulati"))
+	if len(releases) == 1 {
+		return m.selectRelease(releases[0])
 	}
 
-	m.state = psnNsSelect
-	items := make([]Item, len(msg.namespaces))
-	for i, ns := range msg.namespaces {
-		items[i] = Item{Value: ns, Label: ns}
+	items := make([]Item, len(releases))
+	for i, r := range releases {
+		items[i] = Item{Value: r.Name, Label: r.Name, Desc: "namespace " + r.Namespace}
 	}
-	m.list = listModel{title: "Namespace", items: items, width: m.width}
+	m.state = psnReleaseSelect
+	m.list = listModel{title: "Release da deployare", items: items, width: m.width}
 	return m, m.list.Init()
 }
 
-func (m PSNWorkflowModel) finishNsSelect() (tea.Model, tea.Cmd) {
-	m.namespace = m.list.selected
-
-	if !m.testUI {
-		m.project = m.cfg.PSN.ProjectForNamespace(m.namespace)
+func (m PSNWorkflowModel) finishReleaseSelect() (tea.Model, tea.Cmd) {
+	for _, r := range m.cluster.Releases {
+		if r.Name == m.list.selected {
+			return m.selectRelease(r)
+		}
 	}
+	m.cancelled = true
+	return m, tea.Quit
+}
+
+func (m PSNWorkflowModel) selectRelease(r config.PSNReleaseConfig) (tea.Model, tea.Cmd) {
+	m.release = r
+	m.namespace = r.Namespace
+	if !m.testUI {
+		m.project = m.cfg.PSN.ProjectForNamespace(r.Namespace)
+	}
+	m.log = append(m.log, DimStyle.Render(fmt.Sprintf(
+		"  ·  Release %s  ·  namespace %s  ·  chart %s", r.Name, r.Namespace, r.Chart)))
+	return m.enterChartsPrep()
+}
+
+// ── Charts repo and values ────────────────────────────────────────────────────
+
+// enterChartsPrep aligns the managed clone of the charts repo to the branch the
+// release is deployed from. Chart and values travel together on that branch, and
+// the same values file differs between branches, so the branch is not a detail.
+func (m PSNWorkflowModel) enterChartsPrep() (tea.Model, tea.Cmd) {
+	if m.testUI {
+		m.values = psnFakeValues()
+		return m.enterDepSelect()
+	}
+
+	helmRoot := m.cfg.Config.HelmRootPath
+	if helmRoot == "" {
+		m.log = append(m.log, ErrStyle.Render("  ✗  helm_root_path non configurato: serve per risolvere il repo dei chart"))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	remoteURL, err := logic.GitRemoteURL(helmRoot)
+	if err != nil {
+		m.log = append(m.log, ErrStyle.Render("  ✗  "+err.Error()))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+
+	m.state = psnChartsPrep
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Allineamento repo chart (" + m.release.ChartsBranch + ")")
+	branch := m.release.ChartsBranch
+	reposRoot := config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
+		return psnChartsPrepDoneMsg{dir: dir, err: err}
+	})
+}
+
+func (m PSNWorkflowModel) handleChartsPrepDone(msg psnChartsPrepDoneMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Allineamento del repo chart non riuscito: "+msg.err.Error()))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	m.chartsDir = msg.dir
+	m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
+		"  Chart da origin/"+m.release.ChartsBranch+"  ")+
+		ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
+
+	valuesPath := filepath.Join(m.chartsDir, m.release.Values)
+	values, err := logic.ReadHelmValues(valuesPath)
+	if err != nil {
+		m.log = append(m.log, ErrStyle.Render("  ✗  "+err.Error()))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	m.values = values
+
+	if v, err := logic.ReadChartVersion(filepath.Join(m.chartsDir, m.release.Chart)); err == nil {
+		m.log = append(m.log, DimStyle.Render("  ·  Chart version: "+v))
+	}
+	// The values declare their own namespace: a mismatch means the release is
+	// pointed at the wrong file, which would deploy into the wrong place.
+	if values.Namespace != "" && values.Namespace != m.namespace {
+		m.log = append(m.log, WarnStyle.Render(fmt.Sprintf(
+			"  ⚠  Il values dichiara namespace %q, la configurazione %q", values.Namespace, m.namespace)))
+	}
+
 	if m.project != nil {
 		m.log = append(m.log, DimStyle.Render("  ·  Progetto Docker dedicato: "+m.project.DockerRoot))
 		if want := m.project.ExpectedBranch(m.cluster); want != "" {
 			return m.enterProjectRepoPrep(want)
 		}
 	}
-	return m.enterDepLoading()
+	return m.enterDepSelect()
 }
 
 // ── Project repo preparation ──────────────────────────────────────────────────
@@ -333,7 +424,7 @@ func (m PSNWorkflowModel) enterProjectRepoPrep(want string) (tea.Model, tea.Cmd)
 			m.log = append(m.log, wfDryRunLine(fmt.Sprintf(
 				"git fetch + checkout di %s su %s (repo gestito)", m.project.DockerRoot, want)))
 		}
-		return m.enterDepLoading()
+		return m.enterDepSelect()
 	}
 
 	remoteURL, err := logic.GitRemoteURL(m.project.DockerRoot)
@@ -402,49 +493,30 @@ func (m PSNWorkflowModel) projectRoot() string {
 	return m.project.DockerRoot
 }
 
-// ── Deployment loading ────────────────────────────────────────────────────────
+// ── Service selection ─────────────────────────────────────────────────────────
 
-func (m PSNWorkflowModel) enterDepLoading() (tea.Model, tea.Cmd) {
-	m.state = psnDepLoading
-	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Lettura deployment in " + m.namespace)
-
-	namespace := m.namespace
-	simulated := m.testUI || m.dryRun
-	testUI := m.testUI
-	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		if simulated {
-			if testUI {
-				time.Sleep(600 * time.Millisecond)
-			}
-			return psnDepLoadedMsg{deployments: psnFakeDeployments()}
-		}
-		deployments, err := logic.ListDeployments(namespace)
-		return psnDepLoadedMsg{deployments: deployments, err: err}
-	})
-}
-
-// ── Deployment selection ──────────────────────────────────────────────────────
-
-func (m PSNWorkflowModel) handleDepLoaded(msg psnDepLoadedMsg) (tea.Model, tea.Cmd) {
-	if msg.err != nil {
-		m.log = append(m.log, ErrStyle.Render("  ✗  Lettura deployment fallita: "+msg.err.Error()))
-		return m, tea.Quit
-	}
-	if len(msg.deployments) == 0 {
-		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun deployment trovato in %q", m.namespace)))
+// enterDepSelect offers the services declared in the values file. With Helm the
+// values are the source of truth: they hold the tag that will actually be
+// applied, which is the one worth incrementing.
+func (m PSNWorkflowModel) enterDepSelect() (tea.Model, tea.Cmd) {
+	if len(m.values.Services) == 0 {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Nessun servizio con immagine in "+m.release.Values))
+		m.cancelled = true
 		return m, tea.Quit
 	}
 
-	m.depByName = make(map[string]logic.DeploymentInfo, len(msg.deployments))
-	items := make([]Item, len(msg.deployments))
-	for i, dep := range msg.deployments {
-		m.depByName[dep.Name] = dep
-		_, tag := logic.SplitImageRef(dep.Image)
-		if tag == "" {
-			tag = "(senza tag)"
+	m.svcByName = make(map[string]logic.HelmService, len(m.values.Services))
+	items := make([]Item, 0, len(m.values.Services))
+	for _, svc := range m.values.Services {
+		m.svcByName[svc.Name] = svc
+		desc := svc.Tag
+		if len(svc.Keys) > 1 {
+			desc += fmt.Sprintf("  ·  %d riferimenti", len(svc.Keys))
 		}
-		items[i] = Item{Value: dep.Name, Label: dep.Name, Desc: tag}
+		if !svc.TagsAgree() {
+			desc += "  ·  tag divergenti nel values"
+		}
+		items = append(items, Item{Value: svc.Name, Label: svc.Name, Desc: desc})
 	}
 
 	m.state = psnDepSelect
@@ -464,28 +536,33 @@ func (m PSNWorkflowModel) finishDepSelect() (tea.Model, tea.Cmd) {
 			selected = append(selected, item.Value)
 		}
 	}
+	if len(selected) == 0 {
+		m.cancelled = true
+		return m, tea.Quit
+	}
 	m.selectedDeps = selected
 	m.depIdx = 0
 	return m.startNextDeployment()
 }
 
-// ── Per-deployment pipeline ───────────────────────────────────────────────────
+// ── Per-service pipeline ──────────────────────────────────────────────────────
 
+// startNextDeployment builds and pushes one image at a time; the release is
+// upgraded once, at the end, with every new tag in the same revision.
 func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
 	if m.depIdx >= len(m.selectedDeps) {
-		m.state = psnSummary
-		return m, tea.Quit
+		return m.enterHelmDeploy()
 	}
 
 	name := m.selectedDeps[m.depIdx]
-	m.dep = m.depByName[name]
-	m.repo, m.oldTag = logic.SplitImageRef(m.dep.Image)
+	m.svc = m.svcByName[name]
+	m.repo = m.svc.Repository
+	m.oldTag = m.svc.Tag
 	m.newTag = ""
 	m.dockerfilePath = ""
 	m.buildArgs = make(map[string]string)
 	m.buildArgQueue = nil
 	m.buildArgIdx = 0
-	m.imageApplied = false
 	m.depStart = time.Now()
 
 	SetStatus(name, m.cluster.Name)
@@ -494,10 +571,10 @@ func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
 		m.log = append(m.log, "\n"+SectionStyle.Render(fmt.Sprintf(
 			"── Servizio [%d/%d]: %s", m.depIdx+1, len(m.selectedDeps), strings.ToUpper(name))))
 	}
-	m.log = append(m.log, DimStyle.Render("  ·  Immagine corrente: "+m.dep.Image))
-	if m.dep.Containers > 1 {
-		m.log = append(m.log, WarnStyle.Render(fmt.Sprintf(
-			"  ⚠  %d container nel pod template — verrà aggiornato %q", m.dep.Containers, m.dep.Container)))
+	m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  Immagine corrente: %s:%s", m.repo, m.oldTag)))
+	if !m.svc.TagsAgree() {
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Il values dichiara tag diversi per la stessa immagine: verranno allineati tutti al nuovo tag"))
 	}
 
 	return m.enterTagInput()
@@ -525,11 +602,22 @@ func (m PSNWorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	m.newTag = val
 
 	content := fmt.Sprintf("  %s    %s  →  %s  ",
-		SelectedItemStyle.Render(m.dep.Name),
+		SelectedItemStyle.Render(m.svc.Name),
 		DimStyle.Render(m.oldTag),
 		SuccessStyle.Render(m.newTag),
 	)
 	m.log = append(m.log, "\n"+BoxStyle.Render(content))
+
+	// Redeploying the same tag overwrites the image on ACR, but helm renders an
+	// identical manifest: Kubernetes sees no change and never recreates the pod,
+	// so the old image keeps running. imagePullPolicy: Always does not help —
+	// it governs pod creation, not whether a pod is recreated.
+	if m.newTag == m.oldTag {
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Tag invariato: l'immagine su ACR viene sovrascritta, ma il manifest resta identico"))
+		m.log = append(m.log, WarnStyle.Render(
+			"      e il pod non viene ricreato. Serve un rollout restart, oppure un tag nuovo."))
+	}
 
 	return m.resolveDockerfile()
 }
@@ -550,7 +638,7 @@ func (m PSNWorkflowModel) resolveDockerfile() (tea.Model, tea.Cmd) {
 		return m.resolveProjectDockerfile()
 	}
 
-	if svcName, ok := m.cfg.PSN.Deployments[strings.ToLower(m.dep.Name)]; ok && svcName != "" {
+	if svcName, ok := m.cfg.PSN.Deployments[strings.ToLower(m.svc.Name)]; ok && svcName != "" {
 		if svc, found := m.cfg.Services[svcName]; found && svc.DockerfileSubpath != "" {
 			full := filepath.Join(m.cfg.Config.DockerRootPath, svc.DockerfileSubpath)
 			if abs, err := filepath.Abs(full); err == nil {
@@ -564,7 +652,7 @@ func (m PSNWorkflowModel) resolveDockerfile() (tea.Model, tea.Cmd) {
 			}
 		} else {
 			m.log = append(m.log, WarnStyle.Render(fmt.Sprintf(
-				"  ⚠  Mapping %q → servizio %q non risolvibile in config", m.dep.Name, svcName)))
+				"  ⚠  Mapping %q → servizio %q non risolvibile in config", m.svc.Name, svcName)))
 			return m.enterDockerfileMissing(m.cfg.Config.DockerRootPath)
 		}
 	}
@@ -579,7 +667,7 @@ func (m PSNWorkflowModel) enterDockerfileMissing(scanRoot string) (tea.Model, te
 	m.scanRoot = scanRoot
 	m.state = psnDockerfileMissing
 	m.list = listModel{
-		title: "Dockerfile di " + m.dep.Name + " non risolto",
+		title: "Dockerfile di " + m.svc.Name + " non risolto",
 		items: []Item{
 			{Value: "cancel", Label: "Annulla  — interrompe il deploy senza buildare"},
 			{Value: "scan", Label: "Cerca comunque un Dockerfile", Desc: "l'immagine verrà pushata su " + m.repo},
@@ -591,7 +679,7 @@ func (m PSNWorkflowModel) enterDockerfileMissing(scanRoot string) (tea.Model, te
 
 func (m PSNWorkflowModel) finishDockerfileMissing() (tea.Model, tea.Cmd) {
 	if m.list.selected != "scan" {
-		m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.dep.Name+" non risolto"))
+		m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.svc.Name+" non risolto"))
 		m.cancelled = true
 		return m, tea.Quit
 	}
@@ -611,7 +699,7 @@ func (m PSNWorkflowModel) enterDockerfileScan(root string) (tea.Model, tea.Cmd) 
 
 	m.state = psnDockerfileList
 	m.list = listModel{
-		title: wfDockerfileListTitle(m.dep.Name, m.repo),
+		title: wfDockerfileListTitle(m.svc.Name, m.repo),
 		items: dockerfileItems(files, root),
 		width: m.width,
 	}
@@ -623,7 +711,7 @@ func (m PSNWorkflowModel) enterDockerfileScan(root string) (tea.Model, tea.Cmd) 
 func (m PSNWorkflowModel) resolveProjectDockerfile() (tea.Model, tea.Cmd) {
 	root := m.projectRoot()
 
-	if rel, ok := m.project.Deployments[strings.ToLower(m.dep.Name)]; ok && rel != "" {
+	if rel, ok := m.project.Deployments[strings.ToLower(m.svc.Name)]; ok && rel != "" {
 		full := filepath.Join(root, rel)
 		if _, err := os.Stat(full); err == nil {
 			m.dockerfilePath = full
@@ -634,7 +722,7 @@ func (m PSNWorkflowModel) resolveProjectDockerfile() (tea.Model, tea.Cmd) {
 		return m.enterDockerfileMissing(root)
 	}
 
-	conventional := filepath.Join(root, m.dep.Name, "Dockerfile")
+	conventional := filepath.Join(root, m.svc.Name, "Dockerfile")
 	if _, err := os.Stat(conventional); err == nil {
 		m.dockerfilePath = conventional
 		m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+conventional))
@@ -694,13 +782,13 @@ func (m PSNWorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("docker build --no-cache -t %s:%s -f %s%s %s",
 			m.repo, m.newTag, m.dockerfilePath, buildArgStr, filepath.Dir(m.dockerfilePath))))
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("docker push %s:%s", m.repo, m.newTag)))
-		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("kubectl set image deployment/%s %s=%s:%s -n %s",
-			m.dep.Name, m.dep.Container, m.repo, m.newTag, m.namespace)))
-		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("kubectl rollout status deployment/%s -n %s --timeout 300s",
-			m.dep.Name, m.namespace)))
 		m.log = append(m.log, "\n"+SecondaryStyle.Render(fmt.Sprintf(
-			"  ◆  DRY-RUN  —  %s  %s → %s  (non deployato)", m.dep.Name, m.oldTag, m.newTag)))
-		m.results = append(m.results, DeployResult{Service: m.dep.Name, OldTag: m.oldTag, NewTag: m.newTag, Skipped: true})
+			"  ◆  DRY-RUN  —  %s  %s → %s  (non deployato)", m.svc.Name, m.oldTag, m.newTag)))
+		m.results = append(m.results, DeployResult{Service: m.svc.Name, OldTag: m.oldTag, NewTag: m.newTag, Skipped: true})
+		// Recorded in dry-run too: without it the run would have nothing to
+		// deploy and would skip straight past the helm upgrade and the sync,
+		// which are the two commands worth previewing.
+		m.deployed = append(m.deployed, psnDeployed{svc: m.svc, oldTag: m.oldTag, newTag: m.newTag})
 		m.depIdx++
 		return m.startNextDeployment()
 	}
@@ -744,44 +832,56 @@ func (m PSNWorkflowModel) enterPush() (tea.Model, tea.Cmd) {
 	})
 }
 
-// ── Deploy: set image + rollout ───────────────────────────────────────────────
+// ── Deploy: helm upgrade ──────────────────────────────────────────────────────
 
-func (m PSNWorkflowModel) enterSetImage() (tea.Model, tea.Cmd) {
-	m.state = psnSettingImage
+// enterHelmDeploy upgrades the release once, carrying every new tag in the same
+// revision. One upgrade per service would produce a revision each and, on a
+// partial failure, a release updated halfway.
+func (m PSNWorkflowModel) enterHelmDeploy() (tea.Model, tea.Cmd) {
+	if len(m.deployed) == 0 {
+		m.state = psnSummary
+		return m, tea.Quit
+	}
+
+	setArgs := m.helmSetArgs()
+	chartDir := filepath.Join(m.chartsDir, m.release.Chart)
+	valuesPath := filepath.Join(m.chartsDir, m.release.Values)
+
+	if m.dryRun {
+		m.log = append(m.log, wfDryRunLine(logic.HelmCommandLine(
+			m.release.Name, chartDir, valuesPath, m.namespace, setArgs)))
+		return m.enterSync()
+	}
+
+	m.state = psnHelmDeploy
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("kubectl set image")
-	namespace := m.namespace
-	depName := m.dep.Name
-	container := m.dep.Container
-	image := m.repo + ":" + m.newTag
-	testUI := m.testUI
+	m.spinner = newSpinnerModel("helm upgrade " + m.release.Name)
+	release, namespace, testUI := m.release.Name, m.namespace, m.testUI
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
 		if testUI {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(1500 * time.Millisecond)
 			return psnOpDoneMsg{}
 		}
 		var buf bytes.Buffer
-		err := logic.KubectlSetImage(namespace, depName, container, image, &buf)
+		err := logic.HelmDeployChart(release, chartDir, valuesPath, namespace, setArgs, &buf)
 		return psnOpDoneMsg{err: err, output: buf.Bytes()}
 	})
 }
 
-func (m PSNWorkflowModel) enterRollout() (tea.Model, tea.Cmd) {
-	m.state = psnRollingOut
-	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Rollout in corso")
-	namespace := m.namespace
-	depName := m.dep.Name
-	testUI := m.testUI
-	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		if testUI {
-			time.Sleep(1200 * time.Millisecond)
-			return psnOpDoneMsg{}
+// helmSetArgs is one --set per values key of every image bumped. An image
+// referenced twice gets both its keys, or the two references would drift apart.
+func (m PSNWorkflowModel) helmSetArgs() []string {
+	var args []string
+	for _, d := range m.deployed {
+		for _, k := range d.svc.Keys {
+			if k.ImagePath != "" {
+				args = append(args, fmt.Sprintf("%s=%s:%s", k.SetKey, k.ImagePath, d.newTag))
+			} else {
+				args = append(args, fmt.Sprintf("%s=%s", k.SetKey, d.newTag))
+			}
 		}
-		var buf bytes.Buffer
-		err := logic.KubectlRolloutStatus(namespace, depName, 5*time.Minute, &buf)
-		return psnOpDoneMsg{err: err, output: buf.Bytes()}
-	})
+	}
+	return args
 }
 
 // ── Deploy error recovery ─────────────────────────────────────────────────────
@@ -791,9 +891,8 @@ func (m PSNWorkflowModel) enterDeployError() (tea.Model, tea.Cmd) {
 	m.list = listModel{
 		title: "Cosa vuoi fare?",
 		items: []Item{
-			{Value: "retry", Label: "Riprova  — riesegui set image e attendi il rollout"},
-			{Value: "rollback", Label: "Rollback — ripristina il deployment e rimuove l'immagine da ACR"},
-			{Value: "cancel", Label: "Annulla  — esce senza rimuovere l'immagine da ACR"},
+			{Value: "retry", Label: "Riprova  — riesegue helm upgrade"},
+			{Value: "cancel", Label: "Annulla  — il release resta invariato, le immagini restano su ACR"},
 		},
 		width: m.width,
 	}
@@ -801,39 +900,79 @@ func (m PSNWorkflowModel) enterDeployError() (tea.Model, tea.Cmd) {
 }
 
 func (m PSNWorkflowModel) finishDeployError() (tea.Model, tea.Cmd) {
-	switch m.list.selected {
-	case "retry":
-		return m.enterSetImage()
-	case "rollback":
-		return m.enterRollbackOp()
-	default:
-		m.cancelled = true
-		return m, tea.Quit
+	if m.list.selected == "retry" {
+		return m.enterHelmDeploy()
 	}
+	m.cancelled = true
+	return m, tea.Quit
 }
 
-// ── Rollback ──────────────────────────────────────────────────────────────────
+// ── Sync: il tag torna nel values ─────────────────────────────────────────────
 
-func (m PSNWorkflowModel) enterRollbackOp() (tea.Model, tea.Cmd) {
-	m.state = psnRollback
+// enterSync writes the deployed tags into the values file and pushes them. The
+// upgrade carried them as --set overrides only: without this the next
+// `helm upgrade` run by anybody from that branch would put the old tags back.
+func (m PSNWorkflowModel) enterSync() (tea.Model, tea.Cmd) {
+	if len(m.deployed) == 0 || m.testUI {
+		m.state = psnSummary
+		return m, tea.Quit
+	}
+	if m.dryRun {
+		m.log = append(m.log, wfDryRunLine(fmt.Sprintf(
+			"aggiornamento di %s + commit e push su %s", m.release.Values, m.release.ChartsBranch)))
+		m.state = psnSummary
+		return m, tea.Quit
+	}
+
+	remoteURL, err := logic.GitRemoteURL(m.cfg.Config.HelmRootPath)
+	if err != nil {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Sync non eseguito: "+err.Error()))
+		m.syncErr = err
+		m.state = psnSummary
+		return m, tea.Quit
+	}
+
+	m.state = psnSync
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Rollback (deployment + ACR)")
-	namespace := m.namespace
-	depName := m.dep.Name
-	acrName := m.cluster.ACRName
-	repo := m.repo
-	newTag := m.newTag
-	imageApplied := m.imageApplied
+	m.spinner = newSpinnerModel("Sync del values su " + m.release.ChartsBranch)
+
+	deployed := m.deployed
+	valuesRel := m.release.Values
+	branch := m.release.ChartsBranch
+	reposRoot := config.GetReposRoot()
+	message := logic.DeployCommitMessageFor(psnDeployedServices(deployed))
+
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		var buf bytes.Buffer
-		if imageApplied {
-			if err := logic.KubectlRolloutUndo(namespace, depName, &buf); err != nil {
-				return psnOpDoneMsg{err: err, output: buf.Bytes()}
-			}
+		err := logic.SyncToBranch(remoteURL, branch, reposRoot, message,
+			func(dir string) ([]string, error) {
+				path := filepath.Join(dir, valuesRel)
+				for _, d := range deployed {
+					for _, k := range d.svc.Keys {
+						if err := logic.UpdateHelmValuesTag(path, k.SetKey, d.newTag, k.ImagePath); err != nil {
+							return nil, fmt.Errorf("%s: %w", d.svc.Name, err)
+						}
+					}
+				}
+				return []string{valuesRel}, nil
+			}, nil)
+
+		if err != nil {
+			return psnSyncDoneMsg{err: err, lines: []string{
+				ErrStyle.Render("  ✗  Sync del values non riuscito: " + err.Error()),
+				WarnStyle.Render("      " + branch + " non riflette il deploy: al prossimo helm upgrade i tag tornerebbero indietro."),
+			}}
 		}
-		err := logic.ACRDeleteImage(acrName, repo, newTag)
-		return psnOpDoneMsg{err: err, output: buf.Bytes()}
+		return psnSyncDoneMsg{lines: []string{
+			SuccessStyle.Render("  ✓  Values aggiornato e pushato su " + branch)}}
 	})
+}
+
+func psnDeployedServices(deployed []psnDeployed) []logic.DeployedService {
+	out := make([]logic.DeployedService, 0, len(deployed))
+	for _, d := range deployed {
+		out = append(out, logic.DeployedService{Name: d.svc.Name, Tag: d.newTag})
+	}
+	return out
 }
 
 // ── handleOpDone ──────────────────────────────────────────────────────────────
@@ -855,19 +994,12 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 				m.log = append(m.log, DimStyle.Render(string(msg.output)))
 			}
 			return m, tea.Quit
-		case psnSettingImage:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Set image fallito: "+msg.err.Error()))
-			return m.enterDeployError()
-		case psnRollingOut:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Rollout fallito: "+msg.err.Error()))
+		case psnHelmDeploy:
+			m.log = append(m.log, ErrStyle.Render("  ✗  helm upgrade fallito: "+msg.err.Error()))
 			if len(msg.output) > 0 {
 				m.log = append(m.log, DimStyle.Render(string(msg.output)))
 			}
 			return m.enterDeployError()
-		case psnRollback:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Rollback fallito: "+msg.err.Error()))
-			m.cancelled = true
-			return m, tea.Quit
 		}
 	}
 
@@ -878,28 +1010,22 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 
 	case psnPushing:
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Push  ")+ValueStyle.Render(elapsed))
-		return m.enterSetImage()
-
-	case psnSettingImage:
-		m.imageApplied = true
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Set image  ")+ValueStyle.Render(elapsed))
-		return m.enterRollout()
-
-	case psnRollingOut:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Rollout  ")+ValueStyle.Render(elapsed))
-		m.results = append(m.results, DeployResult{
-			Service: m.dep.Name,
-			OldTag:  m.oldTag,
-			NewTag:  m.newTag,
-			Elapsed: time.Since(m.depStart),
-		})
+		m.deployed = append(m.deployed, psnDeployed{svc: m.svc, oldTag: m.oldTag, newTag: m.newTag})
 		m.depIdx++
 		return m.startNextDeployment()
 
-	case psnRollback:
-		m.log = append(m.log, WarnStyle.Render("  ⚠  Rollback completato"))
-		m.cancelled = true
-		return m, tea.Quit
+	case psnHelmDeploy:
+		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
+			"  helm upgrade "+m.release.Name+"  ")+ValueStyle.Render(elapsed))
+		for _, d := range m.deployed {
+			m.results = append(m.results, DeployResult{
+				Service: d.svc.Name,
+				OldTag:  d.oldTag,
+				NewTag:  d.newTag,
+				Elapsed: time.Since(m.depStart),
+			})
+		}
+		return m.enterSync()
 	}
 	return m, nil
 }
@@ -913,10 +1039,10 @@ func (m PSNWorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case psnNsLoading, psnRepoPrep, psnDepLoading, psnBuilding, psnPushing, psnSettingImage, psnRollingOut, psnRollback:
+	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnSync:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinner.spinner.View(), elapsed))
-	case psnNsSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
+	case psnReleaseSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
 		sb.WriteString(m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString(m.multisel.View().Content)
@@ -945,26 +1071,22 @@ func (m PSNWorkflowModel) renderTracker() string {
 
 	var nsTab string
 	switch {
-	case m.state <= psnNsSelect:
+	case m.state <= psnChartsPrep:
 		marker := CursorStyle.Render("▸")
-		if m.state == psnNsLoading {
+		if m.state == psnChartsPrep {
 			marker = m.spinner.spinner.View()
 		}
-		nsTab = marker + " " + ValueStyle.Render("Namespace")
+		nsTab = marker + " " + ValueStyle.Render("Release")
 	default:
-		nsTab = SuccessStyle.Render("✓ Namespace")
+		nsTab = SuccessStyle.Render("✓ Release")
 	}
 
 	var depTab string
 	switch {
-	case m.state < psnDepLoading:
+	case m.state < psnDepSelect:
 		depTab = DimStyle.Render("· Servizi")
-	case m.state <= psnDepSelect:
-		marker := CursorStyle.Render("▸")
-		if m.state == psnDepLoading {
-			marker = m.spinner.spinner.View()
-		}
-		depTab = marker + " " + ValueStyle.Render("Servizi")
+	case m.state == psnDepSelect:
+		depTab = CursorStyle.Render("▸") + " " + ValueStyle.Render("Servizi")
 	default:
 		depTab = SuccessStyle.Render("✓ Servizi")
 	}
@@ -981,7 +1103,7 @@ func (m PSNWorkflowModel) renderTracker() string {
 		}
 		pipeTab = CursorStyle.Render("▸") + "  " +
 			ValueStyle.Render(fmt.Sprintf("Pipeline [%d/%d]", cur, total)) +
-			"  " + SelectedItemStyle.Render(strings.ToUpper(m.dep.Name))
+			"  " + SelectedItemStyle.Render(strings.ToUpper(m.svc.Name))
 	}
 
 	div := DimStyle.Render("   │   ")
@@ -1037,7 +1159,7 @@ func (m PSNWorkflowModel) renderPipelineStages() string {
 			return stDone
 		}
 		switch m.state {
-		case psnSettingImage, psnRollingOut, psnRollback:
+		case psnHelmDeploy, psnSync:
 			return stSpinning
 		case psnDeployError:
 			return stFailed
@@ -1052,8 +1174,9 @@ func (m PSNWorkflowModel) renderPipelineStages() string {
 	stages := []stageEntry{
 		{"Config", configStatus()},
 		{"Build", asyncStatus(psnBuilding, psnPushing)},
-		{"Push", asyncStatus(psnPushing, psnSettingImage)},
+		{"Push", asyncStatus(psnPushing, psnHelmDeploy)},
 		{"Deploy", deployStatus()},
+		{"Sync", asyncStatus(psnSync, psnSummary)},
 	}
 
 	frame := m.spinner.spinner.View()

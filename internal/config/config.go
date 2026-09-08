@@ -126,15 +126,30 @@ type ServiceConfig struct {
 	K8sImageRef       string `mapstructure:"k8s_image_ref"      yaml:"k8s_image_ref,omitempty"`
 }
 
+// PSNReleaseConfig is one Helm release deployable on a cluster. A cluster hosts
+// more than one (on Cluster A both app-site-a-coll and vault), so releases are a list.
+//
+// Nothing here is derived: the naming that holds for the app chart
+// (app-<sito>-<env>) does not hold for the others in the same repository, and a
+// convention that breaks on the second case is worse than none.
+type PSNReleaseConfig struct {
+	Name         string `mapstructure:"name"          yaml:"name"` // helm release, e.g. app-site-a-coll
+	Namespace    string `mapstructure:"namespace"     yaml:"namespace"`
+	Chart        string `mapstructure:"chart"         yaml:"chart"`         // chart directory in the charts repo, e.g. "app"
+	Values       string `mapstructure:"values"        yaml:"values"`        // values file in the charts repo
+	ChartsBranch string `mapstructure:"charts_branch" yaml:"charts_branch"` // branch the chart and values are read from
+}
+
 // PSNClusterConfig identifies one PSN target environment
 // (Azure subscription + AKS cluster + ACR registry).
 type PSNClusterConfig struct {
-	Name           string `mapstructure:"name"            yaml:"name"`
-	SubscriptionID string `mapstructure:"subscription_id" yaml:"subscription_id"`
-	ResourceGroup  string `mapstructure:"resource_group"  yaml:"resource_group"`
-	AKSName        string `mapstructure:"aks_name"        yaml:"aks_name"`
-	ACRName        string `mapstructure:"acr_name"        yaml:"acr_name"`
-	Env            string `mapstructure:"env"             yaml:"env"` // coll | prod
+	Name           string             `mapstructure:"name"            yaml:"name"`
+	SubscriptionID string             `mapstructure:"subscription_id" yaml:"subscription_id"`
+	ResourceGroup  string             `mapstructure:"resource_group"  yaml:"resource_group"`
+	AKSName        string             `mapstructure:"aks_name"        yaml:"aks_name"`
+	ACRName        string             `mapstructure:"acr_name"        yaml:"acr_name"`
+	Env            string             `mapstructure:"env"             yaml:"env"` // coll | prod
+	Releases       []PSNReleaseConfig `mapstructure:"releases"        yaml:"releases"`
 }
 
 // IsProd reports whether the cluster is a production environment.

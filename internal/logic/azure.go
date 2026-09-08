@@ -68,25 +68,3 @@ func ACRLogin(acrName string, out io.Writer) error {
 	}
 	return nil
 }
-
-// ACRDeleteImage removes a tag from an Azure Container Registry repository.
-// Used to roll back a pushed image. repository accepts either the bare path
-// ("org/service") or the full reference ("registry.azurecr.io/org/service").
-func ACRDeleteImage(acrName, repository, tag string) error {
-	if idx := strings.Index(repository, "/"); idx != -1 && strings.Contains(repository[:idx], ".") {
-		repository = repository[idx+1:]
-	}
-
-	var stderr bytes.Buffer
-	cmd := exec.Command(
-		"az", "acr", "repository", "delete",
-		"--name", acrName,
-		"--image", fmt.Sprintf("%s:%s", repository, tag),
-		"--yes",
-	)
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("rollback ACR fallito: %s", strings.TrimSpace(stderr.String()))
-	}
-	return nil
-}
