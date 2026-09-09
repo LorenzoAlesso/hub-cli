@@ -126,12 +126,9 @@ type ServiceConfig struct {
 	K8sImageRef       string `mapstructure:"k8s_image_ref"      yaml:"k8s_image_ref,omitempty"`
 }
 
-// PSNReleaseConfig is one Helm release deployable on a cluster. A cluster hosts
-// more than one (on Cluster A both app-site-a-coll and vault), so releases are a list.
-//
-// Nothing here is derived: the naming that holds for the app chart
-// (app-<sito>-<env>) does not hold for the others in the same repository, and a
-// convention that breaks on the second case is worse than none.
+// PSNReleaseConfig is one Helm release deployable on a cluster, and a cluster
+// hosts more than one. Nothing is derived: the naming that holds for one chart
+// does not hold for the others in the same repository.
 type PSNReleaseConfig struct {
 	Name         string `mapstructure:"name"          yaml:"name"` // helm release, e.g. app-site-a-coll
 	Namespace    string `mapstructure:"namespace"     yaml:"namespace"`

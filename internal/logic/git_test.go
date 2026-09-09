@@ -254,7 +254,7 @@ func TestSyncToBranchNoChangeIsNotAnError(t *testing.T) {
 
 func TestDeployCommitMessageFor(t *testing.T) {
 	one := DeployCommitMessageFor([]DeployedService{{Name: "app-webapp", Tag: "1.2.3-dev"}})
-	if one != "chore(deploy): app-webapp → 1.2.3-dev" {
+	if one != "chore(deploy): app-webapp → 1.2.3-dev\n\nDeploy eseguito con hub-cli." {
 		t.Errorf("messaggio singolo = %q", one)
 	}
 
@@ -262,7 +262,12 @@ func TestDeployCommitMessageFor(t *testing.T) {
 		{Name: "app-webapp", Tag: "1.2.3-dev"},
 		{Name: "app-consul", Tag: "2.0.1-dev"},
 	})
-	if many != "chore(deploy): app-webapp → 1.2.3-dev, app-consul → 2.0.1-dev" {
+	if many != "chore(deploy): app-webapp → 1.2.3-dev, app-consul → 2.0.1-dev\n\nDeploy eseguito con hub-cli." {
 		t.Errorf("messaggio multiplo = %q", many)
+	}
+
+	// The subject line stays the summary: it is what shows up in git log.
+	if subject := strings.SplitN(many, "\n", 2)[0]; strings.Contains(subject, "hub-cli") {
+		t.Errorf("il trailer non deve finire nella prima riga: %q", subject)
 	}
 }

@@ -405,10 +405,14 @@ func (m PSNWorkflowModel) handleChartsPrepDone(msg psnChartsPrepDoneMsg) (tea.Mo
 	}
 
 	if m.project != nil {
-		m.log = append(m.log, DimStyle.Render("  ·  Progetto Docker dedicato: "+m.project.DockerRoot))
+		// With a branch declared the configured path only supplies the remote
+		// URL: the build reads from the managed clone aligned right after.
 		if want := m.project.ExpectedBranch(m.cluster); want != "" {
+			m.log = append(m.log, DimStyle.Render(
+				"  ·  Progetto Docker configurato: "+m.project.DockerRoot+" — la build usa il clone gestito"))
 			return m.enterProjectRepoPrep(want)
 		}
+		m.log = append(m.log, DimStyle.Render("  ·  Progetto Docker dedicato: "+m.project.DockerRoot))
 	}
 	return m.enterDepSelect()
 }
@@ -601,12 +605,7 @@ func (m PSNWorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	}
 	m.newTag = val
 
-	content := fmt.Sprintf("  %s    %s  →  %s  ",
-		SelectedItemStyle.Render(m.svc.Name),
-		DimStyle.Render(m.oldTag),
-		SuccessStyle.Render(m.newTag),
-	)
-	m.log = append(m.log, "\n"+BoxStyle.Render(content))
+	m.log = append(m.log, wfTagCard(m.svc.Name, m.oldTag, m.newTag))
 
 	// Redeploying the same tag overwrites the image on ACR, but helm renders an
 	// identical manifest: Kubernetes sees no change and never recreates the pod,
@@ -782,8 +781,6 @@ func (m PSNWorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("docker build --no-cache -t %s:%s -f %s%s %s",
 			m.repo, m.newTag, m.dockerfilePath, buildArgStr, filepath.Dir(m.dockerfilePath))))
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("docker push %s:%s", m.repo, m.newTag)))
-		m.log = append(m.log, "\n"+SecondaryStyle.Render(fmt.Sprintf(
-			"  ◆  DRY-RUN  —  %s  %s → %s  (non deployato)", m.svc.Name, m.oldTag, m.newTag)))
 		m.results = append(m.results, DeployResult{Service: m.svc.Name, OldTag: m.oldTag, NewTag: m.newTag, Skipped: true})
 		// Recorded in dry-run too: without it the run would have nothing to
 		// deploy and would skip straight past the helm upgrade and the sync,
@@ -920,6 +917,8 @@ func (m PSNWorkflowModel) enterSync() (tea.Model, tea.Cmd) {
 	if m.dryRun {
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf(
 			"aggiornamento di %s + commit e push su %s", m.release.Values, m.release.ChartsBranch)))
+		m.log = append(m.log, "\n"+SecondaryStyle.Render(
+			"  ◆  DRY-RUN  —  "+psnDryRunRecap(m.deployed)+"  (nulla è stato eseguito)"))
 		m.state = psnSummary
 		return m, tea.Quit
 	}
@@ -965,6 +964,15 @@ func (m PSNWorkflowModel) enterSync() (tea.Model, tea.Cmd) {
 		return psnSyncDoneMsg{lines: []string{
 			SuccessStyle.Render("  ✓  Values aggiornato e pushato su " + branch)}}
 	})
+}
+
+// psnDryRunRecap lists what a real run would have deployed, in one line.
+func psnDryRunRecap(deployed []psnDeployed) string {
+	parts := make([]string, 0, len(deployed))
+	for _, d := range deployed {
+		parts = append(parts, fmt.Sprintf("%s %s → %s", d.svc.Name, d.oldTag, d.newTag))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func psnDeployedServices(deployed []psnDeployed) []logic.DeployedService {

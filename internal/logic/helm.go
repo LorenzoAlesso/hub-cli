@@ -49,13 +49,10 @@ func HelmUpgrade(releaseName, chartName, valuesPath, namespace, setArg, chartVer
 	return nil
 }
 
-// HelmDeployChart installs or upgrades a release from a chart directory, with
-// one --set per image being bumped. Deploying the whole selection in a single
-// upgrade produces one release revision instead of one per service, which is
-// also how it is done by hand.
-//
-// No --version is passed: the chart comes from the managed clone, so its version
-// is whatever the branch declares — the point of deploying from the clone.
+// HelmDeployChart installs or upgrades a release from a chart directory, with one
+// --set per image being bumped: a single upgrade means one revision instead of
+// one per service. No --version is passed, the chart comes from the managed clone
+// and its version is whatever the branch declares.
 func HelmDeployChart(releaseName, chartDir, valuesPath, namespace string, setArgs []string, out io.Writer) error {
 	action := "upgrade"
 	if exec.Command("helm", "status", releaseName, "--namespace", namespace).Run() != nil {

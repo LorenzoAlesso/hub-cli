@@ -3,6 +3,7 @@ package logic
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -17,13 +18,10 @@ type HelmImageKey struct {
 	ImagePath string
 }
 
-// HelmService is one deployable image declared in a chart values file. With Helm
-// the values file replaces the cluster discovery PSN used to do: it lists what
-// can be deployed, where each image is pushed and which tag is live.
-//
-// Services are keyed by image, not by values key, because the same image can be
-// referenced more than once: in the Site A values both initContainer and busybox
-// run .../apps/initc, so a new tag has to land on both or they drift apart.
+// HelmService is one deployable image declared in a chart values file: what can
+// be deployed, where it is pushed and which tag is live. Services are keyed by
+// image rather than by values key, because the same image can be referenced more
+// than once and a new tag has to land on every reference.
 type HelmService struct {
 	Name       string // image name, e.g. "jboss-be" — resolves the Dockerfile
 	Repository string // full repository, e.g. "acr.azurecr.io/apps/jboss-be"
@@ -165,7 +163,7 @@ func imageName(repository string) string {
 // deployed version always matches the chart sitting next to the values instead
 // of a number copied into the configuration.
 func ReadChartVersion(chartDir string) (string, error) {
-	path := chartDir + "/Chart.yaml"
+	path := filepath.Join(chartDir, "Chart.yaml")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("lettura %s: %w", path, err)

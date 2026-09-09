@@ -840,12 +840,7 @@ func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	content := fmt.Sprintf("  %s    %s  →  %s  ",
-		SelectedItemStyle.Render(m.svcName),
-		DimStyle.Render(m.oldTag),
-		SuccessStyle.Render(m.newTag),
-	)
-	m.log = append(m.log, "\n"+BoxStyle.Render(content))
+	m.log = append(m.log, wfTagCard(m.svcName, m.oldTag, m.newTag))
 
 	if dockerArgs, err := logic.ParseDockerfileArgs(m.dockerfilePath); err == nil && len(dockerArgs) > 0 {
 		m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  %d build ARG rilevati nel Dockerfile", len(dockerArgs))))
@@ -1259,6 +1254,18 @@ func (m WorkflowModel) renderPipelineStages() string {
 
 func wfDryRunLine(msg string) string {
 	return SecondaryStyle.Render("  ◆ DRY-RUN") + "  " + DimStyle.Render(msg)
+}
+
+// wfTagCard is the log entry announcing the tag a service goes out with. The
+// blank line on each side frames it as a break in the log rather than as a
+// heading for the lines that follow.
+func wfTagCard(serviceName, oldTag, newTag string) string {
+	content := fmt.Sprintf("  %s    %s  →  %s  ",
+		SelectedItemStyle.Render(serviceName),
+		DimStyle.Render(oldTag),
+		SuccessStyle.Render(newTag),
+	)
+	return "\n" + BoxStyle.Render(content) + "\n"
 }
 
 func wfProjectPrefix(serviceName string) string {

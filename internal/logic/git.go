@@ -75,6 +75,10 @@ type DeployedService struct {
 	Tag  string
 }
 
+// deployCommitTrailer marks the commit as coming from hub-cli, so it is
+// recognisable among the ones pushed by hand on the same branch.
+const deployCommitTrailer = "Deploy eseguito con hub-cli."
+
 // DeployCommitMessageFor builds one message for every service deployed in a
 // run: a single commit per workflow means fewer pushes and fewer races.
 func DeployCommitMessageFor(services []DeployedService) string {
@@ -82,7 +86,7 @@ func DeployCommitMessageFor(services []DeployedService) string {
 	for _, svc := range services {
 		parts = append(parts, fmt.Sprintf("%s → %s", svc.Name, svc.Tag))
 	}
-	return "chore(deploy): " + strings.Join(parts, ", ")
+	return "chore(deploy): " + strings.Join(parts, ", ") + "\n\n" + deployCommitTrailer
 }
 
 // GitCurrentBranch returns the checked-out branch of the given repository.
