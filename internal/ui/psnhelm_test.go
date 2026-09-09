@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"Hub-cli/internal/logic"
 )
@@ -175,5 +176,33 @@ func TestDecliningTheRestartStillSyncs(t *testing.T) {
 	next, _ := m.finishRestartPrompt()
 	if got := next.(PSNWorkflowModel); got.state == psnRestarting {
 		t.Error("scelta \"salta\": nessun riavvio va eseguito")
+	}
+}
+
+// The summary is assembled after the shared upgrade, so each service has to carry
+// the time it took: reading the clock at that point gave every card the duration
+// of the last service.
+func TestSummaryKeepsPerServiceDuration(t *testing.T) {
+	m := PSNWorkflowModel{
+		state:  psnHelmDeploy,
+		testUI: true,
+		deployed: []psnDeployed{
+			{svc: logic.HelmService{Name: "jboss-be"}, oldTag: "3.0.9-dev", newTag: "3.0.10-dev",
+				elapsed: 3*time.Minute + 47*time.Second},
+			{svc: logic.HelmService{Name: "webapp"}, oldTag: "3.0.9-dev", newTag: "3.0.10-dev",
+				elapsed: 2*time.Minute + 19*time.Second},
+		},
+	}
+
+	next, _ := m.handleOpDone(psnOpDoneMsg{})
+	results := next.(PSNWorkflowModel).results
+
+	if len(results) != 2 {
+		t.Fatalf("risultati = %d, attesi 2", len(results))
+	}
+	for i, want := range []time.Duration{3*time.Minute + 47*time.Second, 2*time.Minute + 19*time.Second} {
+		if results[i].Elapsed != want {
+			t.Errorf("durata di %s = %v, attesa %v", results[i].Service, results[i].Elapsed, want)
+		}
 	}
 }

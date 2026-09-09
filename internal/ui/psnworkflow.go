@@ -131,11 +131,17 @@ type PSNWorkflowModel struct {
 	results []DeployResult
 }
 
-// psnDeployed is one image built and pushed in this run.
+// psnDeployed is one image built and pushed in this run. The elapsed time is
+// recorded per service, when its push ends: the results are assembled later, in
+// one go after the shared upgrade, and a clock read at that point would give
+// every service the duration of the last one. It covers the service's own
+// pipeline only — the single `helm upgrade` belongs to the whole run and is
+// timed on its own line.
 type psnDeployed struct {
-	svc    logic.HelmService
-	oldTag string
-	newTag string
+	svc     logic.HelmService
+	oldTag  string
+	newTag  string
+	elapsed time.Duration
 }
 
 // RunPSNWorkflow runs the PSN deploy pipeline as a single persistent BubbleTea
@@ -794,7 +800,8 @@ func (m PSNWorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 		// Recorded in dry-run too: without it the run would have nothing to
 		// deploy and would skip straight past the helm upgrade and the sync,
 		// which are the two commands worth previewing.
-		m.deployed = append(m.deployed, psnDeployed{svc: m.svc, oldTag: m.oldTag, newTag: m.newTag})
+		m.deployed = append(m.deployed, psnDeployed{
+			svc: m.svc, oldTag: m.oldTag, newTag: m.newTag, elapsed: time.Since(m.depStart)})
 		m.depIdx++
 		return m.startNextDeployment()
 	}
@@ -1117,7 +1124,8 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 
 	case psnPushing:
 		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Push  ")+ValueStyle.Render(elapsed))
-		m.deployed = append(m.deployed, psnDeployed{svc: m.svc, oldTag: m.oldTag, newTag: m.newTag})
+		m.deployed = append(m.deployed, psnDeployed{
+			svc: m.svc, oldTag: m.oldTag, newTag: m.newTag, elapsed: time.Since(m.depStart)})
 		m.depIdx++
 		return m.startNextDeployment()
 
@@ -1129,7 +1137,7 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 				Service: d.svc.Name,
 				OldTag:  d.oldTag,
 				NewTag:  d.newTag,
-				Elapsed: time.Since(m.depStart),
+				Elapsed: d.elapsed,
 			})
 		}
 		return m.enterRestartPrompt()
