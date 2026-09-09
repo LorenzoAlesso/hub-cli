@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -16,6 +17,13 @@ type HelmImageKey struct {
 	Key       string // top-level values key, e.g. "jbossBe"
 	SetKey    string // dotted path for `helm --set`, e.g. "jbossBe.image.tag"
 	ImagePath string
+
+	// Deployment is the `name` declared next to the image: the Kubernetes
+	// Deployment the templates build from this block. It often matches the image
+	// name, but that is this chart's habit rather than a rule, so a restart has
+	// to read it instead of guessing. Empty when the block declares no name —
+	// an image referenced outside a Deployment, like an init container.
+	Deployment string
 }
 
 // HelmService is one deployable image declared in a chart values file: what can
@@ -94,6 +102,38 @@ func (v *HelmValues) add(ref helmImageRef) {
 	})
 }
 
+// Deployments lists the Kubernetes Deployments running this image, in values
+// order and without repeats, plus the values keys that name none: an image
+// referenced outside a Deployment cannot be restarted, and the caller has to say
+// so rather than skip it quietly.
+func (s HelmService) Deployments() (names []string, unnamed []string) {
+	for _, k := range s.Keys {
+		if k.Deployment == "" {
+			unnamed = append(unnamed, k.Key)
+			continue
+		}
+		if !slices.Contains(names, k.Deployment) {
+			names = append(names, k.Deployment)
+		}
+	}
+	return names, unnamed
+}
+
+// DeploymentFor returns the Deployment declared by the values block setKey points
+// at ("jbossBe.image.tag" → the name in the "jbossBe" block), or "" when the
+// block names none.
+func (v HelmValues) DeploymentFor(setKey string) string {
+	key, _, _ := strings.Cut(setKey, ".")
+	for _, svc := range v.Services {
+		for _, k := range svc.Keys {
+			if k.Key == key {
+				return k.Deployment
+			}
+		}
+	}
+	return ""
+}
+
 // helmImageRef is one image reference found while walking the values.
 type helmImageRef struct {
 	repository string
@@ -113,6 +153,11 @@ func helmImageFrom(key string, node *yaml.Node) (helmImageRef, bool) {
 		return helmImageRef{}, false
 	}
 
+	deployment := ""
+	if name := mappingValue(node, "name"); name != nil && name.Kind == yaml.ScalarNode {
+		deployment = name.Value
+	}
+
 	switch image.Kind {
 	case yaml.MappingNode:
 		repo := mappingValue(image, "repository")
@@ -123,7 +168,7 @@ func helmImageFrom(key string, node *yaml.Node) (helmImageRef, bool) {
 		return helmImageRef{
 			repository: repo.Value,
 			tag:        tag.Value,
-			key:        HelmImageKey{Key: key, SetKey: key + ".image.tag"},
+			key:        HelmImageKey{Key: key, SetKey: key + ".image.tag", Deployment: deployment},
 		}, true
 
 	case yaml.ScalarNode:
@@ -134,7 +179,7 @@ func helmImageFrom(key string, node *yaml.Node) (helmImageRef, bool) {
 		return helmImageRef{
 			repository: repo,
 			tag:        tag,
-			key:        HelmImageKey{Key: key, SetKey: key + ".image", ImagePath: repo},
+			key:        HelmImageKey{Key: key, SetKey: key + ".image", ImagePath: repo, Deployment: deployment},
 		}, true
 	}
 	return helmImageRef{}, false

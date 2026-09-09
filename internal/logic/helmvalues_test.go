@@ -262,3 +262,64 @@ func TestReadChartVersion(t *testing.T) {
 		t.Error("Chart.yaml assente: atteso errore")
 	}
 }
+
+// The Deployment name comes from `name` inside the block, not from the image and
+// not from the values key. On the app chart the three usually coincide, which is
+// exactly why a restart that guessed would look right until it did not.
+const namedValues = `namespace: app-coll
+
+initContainer:
+  image: acr.azurecr.io/apps/initc:dev
+
+railBe:
+  name: rail-be-api
+  image:
+    repository: acr.azurecr.io/apps/rail-be
+    tag: 1.0.0
+
+webapp:
+  image:
+    repository: acr.azurecr.io/apps/webapp
+    tag: 3.0.9-dev
+`
+
+func TestReadHelmValuesTakesDeploymentFromName(t *testing.T) {
+	values, err := ReadHelmValues(writeValues(t, namedValues))
+	if err != nil {
+		t.Fatalf("lettura: %v", err)
+	}
+
+	cases := map[string]string{
+		"railBe.image.tag":    "rail-be-api",
+		"webapp.image.tag":    "",
+		"initContainer.image": "",
+	}
+	for setKey, want := range cases {
+		if got := values.DeploymentFor(setKey); got != want {
+			t.Errorf("DeploymentFor(%q) = %q, atteso %q", setKey, got, want)
+		}
+	}
+	if got := values.DeploymentFor("assente.image.tag"); got != "" {
+		t.Errorf("chiave assente: %q, atteso vuoto", got)
+	}
+}
+
+// An image referenced twice runs in two Deployments, and a reference outside a
+// Deployment has no name at all: both have to come back, because one cannot be
+// restarted and the caller has to say so instead of dropping it.
+func TestServiceDeploymentsSplitNamedFromUnnamed(t *testing.T) {
+	svc := HelmService{Keys: []HelmImageKey{
+		{Key: "jbossBe", Deployment: "jboss-be"},
+		{Key: "jbossBeWorker", Deployment: "jboss-be"},
+		{Key: "jbossFe", Deployment: "jboss-fe"},
+		{Key: "initContainer"},
+	}}
+
+	names, unnamed := svc.Deployments()
+	if len(names) != 2 || names[0] != "jboss-be" || names[1] != "jboss-fe" {
+		t.Errorf("deployment = %v, attesi [jboss-be jboss-fe]", names)
+	}
+	if len(unnamed) != 1 || unnamed[0] != "initContainer" {
+		t.Errorf("senza nome = %v, atteso [initContainer]", unnamed)
+	}
+}

@@ -3,8 +3,10 @@ package logic
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // CurrentKubeContext returns the currently active kubectl context.
@@ -58,4 +60,58 @@ func KubectlUnsetCurrentContext() error {
 	return nil
 }
 
-// systemNamespaces are infrastructural namespaces (Kubernetes, AKS add-ons,
+// rolloutTimeout caps the wait for a restarted pod to become ready. JBoss takes
+// tens of seconds to boot, so the limit is generous: it exists to end the wait
+// on a pod that will never come up, not to time a normal restart.
+const rolloutTimeout = 10 * time.Minute
+
+// RolloutRestart recreates the pods of a deployment. Redeploying an unchanged
+// tag overwrites the image in the registry but renders an identical manifest:
+// Kubernetes sees no difference and keeps running the old image. The command
+// patches the kubectl.kubernetes.io/restartedAt annotation on the pod template,
+// so the manifest does change and the rollout starts on its own.
+func RolloutRestart(deployment, namespace string, out io.Writer) error {
+	cmd := exec.Command("kubectl", "rollout", "restart", "deployment/"+deployment, "--namespace", namespace)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("rollout restart di %s fallito: %w", deployment, err)
+	}
+	return nil
+}
+
+// RolloutStatus waits for a rollout to complete, so a pod that never comes back
+// is reported instead of hiding behind a deploy that looked successful.
+func RolloutStatus(deployment, namespace string, out io.Writer) error {
+	cmd := exec.Command(
+		"kubectl", "rollout", "status", "deployment/"+deployment,
+		"--namespace", namespace,
+		"--timeout", rolloutTimeout.String(),
+	)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("rollout di %s non completato: %w", deployment, err)
+	}
+	return nil
+}
+
+// RestartDeployments restarts each deployment and waits for its rollout before
+// moving to the next: restarting everything at once would take down several
+// services together, and the first failure would be lost in the noise.
+func RestartDeployments(deployments []string, namespace string, out io.Writer) error {
+	for _, name := range deployments {
+		if err := RolloutRestart(name, namespace, out); err != nil {
+			return err
+		}
+		if err := RolloutStatus(name, namespace, out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RolloutRestartCommandLine renders the command RolloutRestart would run, for --dry-run.
+func RolloutRestartCommandLine(deployment, namespace string) string {
+	return fmt.Sprintf("kubectl rollout restart deployment/%s --namespace %s", deployment, namespace)
+}

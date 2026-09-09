@@ -77,3 +77,103 @@ func TestHelmSetArgsEmptyWhenNothingDeployed(t *testing.T) {
 		t.Errorf("--set = %v, atteso nessuno", got)
 	}
 }
+
+// Only the services whose tag stayed the same need a restart: for the others
+// helm changed the manifest and Kubernetes recreated the pod on its own.
+func TestRestartTargetsOnlyCoverUnchangedTags(t *testing.T) {
+	deployed := []psnDeployed{
+		{
+			svc: logic.HelmService{Name: "jboss-be", Keys: []logic.HelmImageKey{
+				{Key: "jbossBe", Deployment: "jboss-be"},
+			}},
+			oldTag: "3.0.9-dev", newTag: "3.0.9-dev",
+		},
+		{
+			svc: logic.HelmService{Name: "webapp", Keys: []logic.HelmImageKey{
+				{Key: "webapp", Deployment: "webapp"},
+			}},
+			oldTag: "3.0.9-dev", newTag: "3.0.10-dev",
+		},
+	}
+
+	targets, unnamed := psnRestartTargets(deployed)
+	if len(targets) != 1 || targets[0] != "jboss-be" {
+		t.Errorf("target = %v, atteso [jboss-be]", targets)
+	}
+	if len(unnamed) != 0 {
+		t.Errorf("senza nome = %v, atteso vuoto", unnamed)
+	}
+}
+
+// The same Deployment reached through two values keys is restarted once, and a
+// key that names no Deployment is reported rather than skipped in silence.
+func TestRestartTargetsDeduplicateAndReportUnnamed(t *testing.T) {
+	deployed := []psnDeployed{{
+		svc: logic.HelmService{Name: "initc", Keys: []logic.HelmImageKey{
+			{Key: "jbossBe", Deployment: "jboss-be"},
+			{Key: "jbossBeAlias", Deployment: "jboss-be"},
+			{Key: "initContainer"},
+		}},
+		oldTag: "dev", newTag: "dev",
+	}}
+
+	targets, unnamed := psnRestartTargets(deployed)
+	if len(targets) != 1 || targets[0] != "jboss-be" {
+		t.Errorf("target = %v, atteso [jboss-be]", targets)
+	}
+	if len(unnamed) != 1 || unnamed[0] != "initContainer" {
+		t.Errorf("senza nome = %v, atteso [initContainer]", unnamed)
+	}
+}
+
+// psnRestartModel is a model parked right after the helm upgrade, with one
+// service deployed under the given tags.
+func psnRestartModel(oldTag, newTag string) PSNWorkflowModel {
+	return PSNWorkflowModel{
+		state:  psnHelmDeploy,
+		testUI: true, // keeps the sync from touching git when no restart is needed
+		deployed: []psnDeployed{{
+			svc: logic.HelmService{Name: "jboss-be", Keys: []logic.HelmImageKey{
+				{Key: "jbossBe", SetKey: "jbossBe.image.tag", Deployment: "jboss-be"},
+			}},
+			oldTag: oldTag, newTag: newTag,
+		}},
+	}
+}
+
+// A successful upgrade of an unchanged tag has left the old pod running, so the
+// workflow has to stop and ask instead of walking on to the sync.
+func TestUnchangedTagAsksForRestartAfterUpgrade(t *testing.T) {
+	next, _ := psnRestartModel("3.0.9-dev", "3.0.9-dev").handleOpDone(psnOpDoneMsg{})
+
+	m := next.(PSNWorkflowModel)
+	if m.state != psnRestartConfirm {
+		t.Fatalf("stato = %v, atteso psnRestartConfirm", m.state)
+	}
+	if len(m.restartTargets) != 1 || m.restartTargets[0] != "jboss-be" {
+		t.Errorf("target = %v, atteso [jboss-be]", m.restartTargets)
+	}
+}
+
+// A new tag changed the manifest, so Kubernetes already recreated the pod: asking
+// would be a question with only one sensible answer.
+func TestNewTagSkipsTheRestartPrompt(t *testing.T) {
+	next, _ := psnRestartModel("3.0.9-dev", "3.0.10-dev").handleOpDone(psnOpDoneMsg{})
+
+	if m := next.(PSNWorkflowModel); m.state == psnRestartConfirm {
+		t.Error("tag nuovo: il riavvio non va proposto")
+	}
+}
+
+// Declining the restart still has to reach the sync: the tags deployed by the
+// upgrade belong in the values whether or not the pod was recreated.
+func TestDecliningTheRestartStillSyncs(t *testing.T) {
+	m := psnRestartModel("3.0.9-dev", "3.0.9-dev")
+	m.restartTargets = []string{"jboss-be"}
+	m.list = listModel{selected: "skip"}
+
+	next, _ := m.finishRestartPrompt()
+	if got := next.(PSNWorkflowModel); got.state == psnRestarting {
+		t.Error("scelta \"salta\": nessun riavvio va eseguito")
+	}
+}

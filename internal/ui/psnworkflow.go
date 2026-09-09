@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,6 +33,8 @@ const (
 	psnPushing
 	psnHelmDeploy
 	psnDeployError
+	psnRestartConfirm
+	psnRestarting
 	psnSync
 	psnSummary
 )
@@ -121,6 +124,10 @@ type PSNWorkflowModel struct {
 	deployed []psnDeployed
 	syncErr  error
 
+	// restartTargets are the Deployments still running the old image after the
+	// upgrade, because their tag did not change.
+	restartTargets []string
+
 	results []DeployResult
 }
 
@@ -164,9 +171,9 @@ func psnFakeValues() logic.HelmValues {
 		Namespace: "demo-ns-col",
 		Services: []logic.HelmService{
 			{Name: "webapp", Repository: "demoacr.azurecr.io/demo/webapp", Tag: "1.0.0",
-				Keys: []logic.HelmImageKey{{Key: "webapp", SetKey: "webapp.image.tag"}}},
+				Keys: []logic.HelmImageKey{{Key: "webapp", SetKey: "webapp.image.tag", Deployment: "webapp"}}},
 			{Name: "jboss-fe", Repository: "demoacr.azurecr.io/demo/jboss-fe", Tag: "2.1.3",
-				Keys: []logic.HelmImageKey{{Key: "jbossFe", SetKey: "jbossFe.image.tag"}}},
+				Keys: []logic.HelmImageKey{{Key: "jbossFe", SetKey: "jbossFe.image.tag", Deployment: "jboss-fe"}}},
 		},
 	}
 }
@@ -234,12 +241,12 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnSync:
+	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnReleaseSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
+	case psnReleaseSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError, psnRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -256,6 +263,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishDockerfile()
 			case psnDockerfileMissing:
 				return m.finishDockerfileMissing()
+			case psnRestartConfirm:
+				return m.finishRestartPrompt()
 			default:
 				return m.finishDeployError()
 			}
@@ -847,6 +856,10 @@ func (m PSNWorkflowModel) enterHelmDeploy() (tea.Model, tea.Cmd) {
 	if m.dryRun {
 		m.log = append(m.log, wfDryRunLine(logic.HelmCommandLine(
 			m.release.Name, chartDir, valuesPath, m.namespace, setArgs)))
+		targets, _ := psnRestartTargets(m.deployed)
+		for _, name := range targets {
+			m.log = append(m.log, wfDryRunLine(logic.RolloutRestartCommandLine(name, m.namespace)))
+		}
 		return m.enterSync()
 	}
 
@@ -902,6 +915,82 @@ func (m PSNWorkflowModel) finishDeployError() (tea.Model, tea.Cmd) {
 	}
 	m.cancelled = true
 	return m, tea.Quit
+}
+
+// ── Restart dei servizi a tag invariato ───────────────────────────────────────
+
+// psnRestartTargets lists the Deployments that came out of the upgrade still
+// running the old image — those whose tag did not change, where helm rendered an
+// identical manifest — plus the values keys that declare no Deployment name and
+// so cannot be restarted.
+func psnRestartTargets(deployed []psnDeployed) (targets []string, unnamed []string) {
+	for _, d := range deployed {
+		if d.newTag != d.oldTag {
+			continue
+		}
+		names, missing := d.svc.Deployments()
+		for _, name := range names {
+			if !slices.Contains(targets, name) {
+				targets = append(targets, name)
+			}
+		}
+		unnamed = append(unnamed, missing...)
+	}
+	return targets, unnamed
+}
+
+// enterRestartPrompt asks before restarting: with one replica and the chart's
+// default rolling update the new pod starts before the old one goes away, so two
+// instances overlap for a few dozen seconds. That is not a surprise to spring on
+// a deploy in progress.
+func (m PSNWorkflowModel) enterRestartPrompt() (tea.Model, tea.Cmd) {
+	targets, unnamed := psnRestartTargets(m.deployed)
+	for _, key := range unnamed {
+		m.log = append(m.log, WarnStyle.Render(fmt.Sprintf(
+			"  ⚠  %s: tag invariato, ma il values non dichiara un nome di deployment — riavvio non possibile", key)))
+	}
+	if len(targets) == 0 {
+		return m.enterSync()
+	}
+	m.restartTargets = targets
+
+	m.state = psnRestartConfirm
+	m.list = listModel{
+		title: "Tag invariato per " + strings.Join(targets, ", ") + " — riavviare?",
+		items: []Item{
+			{Value: "restart", Label: "Riavvia  — rollout restart, il pod riparte con l'immagine appena pushata",
+				Desc: "per qualche decina di secondi girano due istanze insieme"},
+			{Value: "skip", Label: "Salta  — il pod continua a girare l'immagine precedente"},
+		},
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m PSNWorkflowModel) finishRestartPrompt() (tea.Model, tea.Cmd) {
+	if m.list.selected != "restart" {
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Riavvio saltato: "+strings.Join(m.restartTargets, ", ")+" gira ancora l'immagine precedente"))
+		return m.enterSync()
+	}
+	return m.enterRestart()
+}
+
+func (m PSNWorkflowModel) enterRestart() (tea.Model, tea.Cmd) {
+	m.state = psnRestarting
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Rollout restart di " + strings.Join(m.restartTargets, ", "))
+
+	targets, namespace, testUI := m.restartTargets, m.namespace, m.testUI
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if testUI {
+			time.Sleep(1500 * time.Millisecond)
+			return psnOpDoneMsg{}
+		}
+		var buf bytes.Buffer
+		err := logic.RestartDeployments(targets, namespace, &buf)
+		return psnOpDoneMsg{err: err, output: buf.Bytes()}
+	})
 }
 
 // ── Sync: il tag torna nel values ─────────────────────────────────────────────
@@ -1008,6 +1097,16 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 				m.log = append(m.log, DimStyle.Render(string(msg.output)))
 			}
 			return m.enterDeployError()
+		case psnRestarting:
+			// The upgrade already landed: the values still have to be synced,
+			// or the next run from that branch would put the old tags back.
+			m.log = append(m.log, ErrStyle.Render("  ✗  Riavvio non riuscito: "+msg.err.Error()))
+			if len(msg.output) > 0 {
+				m.log = append(m.log, DimStyle.Render(string(msg.output)))
+			}
+			m.log = append(m.log, WarnStyle.Render(
+				"      Il pod potrebbe girare ancora l'immagine precedente: verificare sul cluster."))
+			return m.enterSync()
 		}
 	}
 
@@ -1033,6 +1132,11 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 				Elapsed: time.Since(m.depStart),
 			})
 		}
+		return m.enterRestartPrompt()
+
+	case psnRestarting:
+		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
+			"  Riavvio di "+strings.Join(m.restartTargets, ", ")+"  ")+ValueStyle.Render(elapsed))
 		return m.enterSync()
 	}
 	return m, nil
@@ -1047,10 +1151,10 @@ func (m PSNWorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnSync:
+	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinner.spinner.View(), elapsed))
-	case psnReleaseSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError:
+	case psnReleaseSelect, psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError, psnRestartConfirm:
 		sb.WriteString(m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString(m.multisel.View().Content)
@@ -1167,8 +1271,10 @@ func (m PSNWorkflowModel) renderPipelineStages() string {
 			return stDone
 		}
 		switch m.state {
-		case psnHelmDeploy, psnSync:
+		case psnHelmDeploy, psnRestarting, psnSync:
 			return stSpinning
+		case psnRestartConfirm:
+			return stInteractive
 		case psnDeployError:
 			return stFailed
 		}

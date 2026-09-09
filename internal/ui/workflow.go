@@ -38,6 +38,8 @@ const (
 	wfSvcHelm
 	wfSvcHelmError
 	wfSvcRollback
+	wfSvcRestartConfirm
+	wfSvcRestarting
 	wfPostSync // once per workflow, not once per service
 	wfSummary
 )
@@ -122,6 +124,7 @@ type WorkflowModel struct {
 	dockerRepoDir string            // managed clone the build reads from, "" = working copy
 	deployed      []deployedService // services that reached the cluster, for the final commit
 	syncErr       error
+	restartTarget string // Deployment to restart when the tag did not change
 
 	results []DeployResult
 }
@@ -275,7 +278,7 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback,
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting,
 		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
@@ -305,7 +308,8 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError,
+		wfSvcRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -322,6 +326,8 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishDockerfile()
 			case wfSvcDockerfileMissing:
 				return m.finishDockerfileMissing()
+			case wfSvcRestartConfirm:
+				return m.finishRestartPrompt()
 			}
 			return m.finishHelmError()
 		}
@@ -374,6 +380,16 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 			m.log = append(m.log, ErrStyle.Render("  ✗  Rollback fallito: "+msg.err.Error()))
 			m.cancelled = true
 			return m, tea.Quit
+		case wfSvcRestarting:
+			// The upgrade already landed, so the service counts as deployed:
+			// only the restart failed.
+			m.log = append(m.log, ErrStyle.Render("  ✗  Riavvio non riuscito: "+msg.err.Error()))
+			if len(msg.output) > 0 {
+				m.log = append(m.log, DimStyle.Render(string(msg.output)))
+			}
+			m.log = append(m.log, WarnStyle.Render(
+				"      Il pod potrebbe girare ancora l'immagine precedente: verificare sul cluster."))
+			return m.finishService()
 		}
 	}
 
@@ -401,12 +417,17 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 			m.log = append(m.log, WarnStyle.Render("  ⚠  impossibile aggiornare last_tag: "+err.Error()))
 		}
 		m.deployed = append(m.deployed, deployedService{name: m.svcName, tag: m.newTag, svc: m.svc})
-		return m.finishService()
+		return m.enterRestartPrompt()
 
 	case wfSvcRollback:
 		m.log = append(m.log, WarnStyle.Render("  ⚠  Rollback completato"))
 		m.cancelled = true
 		return m, tea.Quit
+
+	case wfSvcRestarting:
+		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
+			"  Riavvio di "+m.restartTarget+"  ")+ValueStyle.Render(elapsed))
+		return m.finishService()
 	}
 	return m, nil
 }
@@ -842,6 +863,15 @@ func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 
 	m.log = append(m.log, wfTagCard(m.svcName, m.oldTag, m.newTag))
 
+	// Same tag, same rendered manifest: Kubernetes sees no change and keeps the
+	// pod as it is, so the image just pushed never starts on its own.
+	if m.newTag == m.oldTag {
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Tag invariato: l'immagine viene sovrascritta, ma il manifest resta identico"))
+		m.log = append(m.log, WarnStyle.Render(
+			"      e il pod non viene ricreato. Serve un rollout restart, oppure un tag nuovo."))
+	}
+
 	if dockerArgs, err := logic.ParseDockerfileArgs(m.dockerfilePath); err == nil && len(dockerArgs) > 0 {
 		m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  %d build ARG rilevati nel Dockerfile", len(dockerArgs))))
 		m.buildArgQueue = dockerArgs
@@ -898,6 +928,17 @@ func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("docker push %s:%s", m.svc.ECRRepository, m.newTag)))
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("helm upgrade %s %s -f %s --namespace %s --set %s --version %s",
 			m.svc.ReleaseName, m.svc.ChartName, m.valuesPath, m.svc.Namespace, m.helmSetArg, m.chartVersion)))
+		if m.newTag == m.oldTag {
+			// Same fallback as a real run: without a Deployment name there is no
+			// restart to preview, and inventing one from the values key would
+			// print a command that does not exist.
+			if name, err := m.resolveRestartTarget(); err == nil && name != "" {
+				m.log = append(m.log, wfDryRunLine(logic.RolloutRestartCommandLine(name, m.svc.Namespace)))
+			} else {
+				m.log = append(m.log, WarnStyle.Render(
+					"  ⚠  Tag invariato: il values non dichiara un nome di deployment, riavvio non possibile"))
+			}
+		}
 		m.log = append(m.log, "\n"+SecondaryStyle.Render(fmt.Sprintf(
 			"  ◆  DRY-RUN  —  %s  %s → %s  (non deployato)", m.svcName, m.oldTag, m.newTag)))
 		m.results = append(m.results, DeployResult{Service: m.svcName, OldTag: m.oldTag, NewTag: m.newTag, Skipped: true})
@@ -1044,6 +1085,80 @@ func (m WorkflowModel) enterPostSync() (tea.Model, tea.Cmd) {
 	})
 }
 
+// ── Restart a tag invariato ───────────────────────────────────────────────────
+
+// resolveRestartTarget reads the Deployment name out of the values block this
+// service deploys to. The name is not the values key and not the service name:
+// the templates take it from `name` inside the block, so anything else is a
+// guess that would restart the wrong Deployment — or none.
+func (m WorkflowModel) resolveRestartTarget() (string, error) {
+	if m.valuesPath == "" || m.svc.HelmSetKey == "" {
+		return "", nil
+	}
+	values, err := logic.ReadHelmValues(m.valuesPath)
+	if err != nil {
+		return "", err
+	}
+	return values.DeploymentFor(m.svc.HelmSetKey), nil
+}
+
+// enterRestartPrompt asks before restarting a service redeployed under the same
+// tag: helm rendered an identical manifest, so the pod is still running the
+// previous image. The default rolling update starts the new pod before stopping
+// the old one, so the two overlap briefly — worth saying out loud rather than
+// doing silently.
+func (m WorkflowModel) enterRestartPrompt() (tea.Model, tea.Cmd) {
+	if m.newTag != m.oldTag || m.svc.Namespace == "" {
+		return m.finishService()
+	}
+
+	target, err := m.resolveRestartTarget()
+	if err != nil || target == "" {
+		reason := "il values non dichiara un nome di deployment"
+		if err != nil {
+			reason = err.Error()
+		}
+		m.log = append(m.log, WarnStyle.Render("  ⚠  Tag invariato ma riavvio non possibile: "+reason))
+		return m.finishService()
+	}
+	m.restartTarget = target
+
+	m.state = wfSvcRestartConfirm
+	m.list = listModel{
+		title: "Tag invariato per " + target + " — riavviare?",
+		items: []Item{
+			{Value: "restart", Label: "Riavvia  — rollout restart, il pod riparte con l'immagine appena pushata",
+				Desc: "per qualche decina di secondi girano due istanze insieme"},
+			{Value: "skip", Label: "Salta  — il pod continua a girare l'immagine precedente"},
+		},
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishRestartPrompt() (tea.Model, tea.Cmd) {
+	if m.list.selected != "restart" {
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Riavvio saltato: "+m.restartTarget+" gira ancora l'immagine precedente"))
+		return m.finishService()
+	}
+
+	m.state = wfSvcRestarting
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Rollout restart di " + m.restartTarget)
+
+	target, namespace, testUI := m.restartTarget, m.svc.Namespace, m.testUI
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if testUI {
+			time.Sleep(1500 * time.Millisecond)
+			return wfOpDoneMsg{}
+		}
+		var buf bytes.Buffer
+		err := logic.RestartDeployments([]string{target}, namespace, &buf)
+		return wfOpDoneMsg{err: err, output: buf.Bytes()}
+	})
+}
+
 func (m WorkflowModel) finishService() (tea.Model, tea.Cmd) {
 	m.results = append(m.results, DeployResult{
 		Service: m.svcName,
@@ -1071,7 +1186,7 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback,
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting,
 		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
 		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinnerFrame(), elapsed))
@@ -1079,7 +1194,8 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString(m.multisel.View().Content)
 	case wfSvcTagSync:
 		sb.WriteString(m.confirm.View().Content)
-	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError:
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError,
+		wfSvcRestartConfirm:
 		sb.WriteString(m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
 		sb.WriteString(m.input.View().Content)
@@ -1194,8 +1310,11 @@ func (m WorkflowModel) renderPipelineStages() string {
 		if m.state >= wfPostSync {
 			return stDone
 		}
-		if m.state == wfSvcHelm || m.state == wfSvcRollback {
+		if m.state == wfSvcHelm || m.state == wfSvcRollback || m.state == wfSvcRestarting {
 			return stSpinning
+		}
+		if m.state == wfSvcRestartConfirm {
+			return stInteractive
 		}
 		if m.state == wfSvcHelmError {
 			return stFailed
