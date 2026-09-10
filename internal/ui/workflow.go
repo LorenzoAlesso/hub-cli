@@ -32,6 +32,8 @@ const (
 	wfSvcTagSync
 	wfSvcDockerfile
 	wfSvcDockerfileMissing
+	wfSvcDockerBranchSelect
+	wfSvcDockerBranchSwitch
 	wfSvcTagInput
 	wfSvcBuildArg
 	wfSvcBuilding
@@ -63,6 +65,13 @@ type wfDockerBranchesLoadedMsg struct {
 }
 
 type wfDockerRepoPrepDoneMsg struct {
+	dir string
+	err error
+}
+
+// wfDockerSwitchDoneMsg reports the Docker clone moved to another branch in the
+// middle of a service, after its Dockerfile was not found on the first one.
+type wfDockerSwitchDoneMsg struct {
 	dir string
 	err error
 }
@@ -129,14 +138,21 @@ type WorkflowModel struct {
 	restarted     bool   // the service in hand had its pod recreated
 	svcLogStart   int    // where the header of the service in hand sits in the log
 
+	// dockerBranchChoices and dockerfileBranches are read when a Dockerfile is
+	// missing: every branch of origin, and the ones that have this Dockerfile.
+	dockerBranchChoices []string
+	dockerfileBranches  []string
+	switchBranch        string // branch the Docker clone is being moved to
+
 	results []DeployResult
 }
 
 // deployedService remembers what a finished service needs for the final sync.
 type deployedService struct {
-	name string
-	tag  string
-	svc  config.ServiceConfig
+	dockerBranch string // branch of the Docker repo the image was built from
+	name         string
+	tag          string
+	svc          config.ServiceConfig
 }
 
 // RunWorkflow runs the full deploy pipeline as a single persistent BubbleTea program.
@@ -296,6 +312,9 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			formatElapsed(time.Since(m.opStart))))
 		return m.enterServiceSelect()
 	}
+	if sw, ok := msg.(wfDockerSwitchDoneMsg); ok {
+		return m.handleDockerSwitchDone(sw)
+	}
 	if ps, ok := msg.(wfPostSyncDoneMsg); ok {
 		m.log = append(m.log, ps.lines...)
 		m.syncErr = ps.err
@@ -306,7 +325,7 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting,
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting, wfSvcDockerBranchSwitch,
 		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
@@ -336,10 +355,15 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError,
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcHelmError,
 		wfSvcRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
+		if m.list.quit && m.state == wfSvcDockerBranchSelect {
+			// Backing out of the branch list returns to the question it came
+			// from, instead of abandoning the whole run.
+			return m.enterDockerfileMissing()
+		}
 		if m.list.quit {
 			m.cancelled = true
 			return m, tea.Quit
@@ -354,6 +378,8 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishDockerfile()
 			case wfSvcDockerfileMissing:
 				return m.finishDockerfileMissing()
+			case wfSvcDockerBranchSelect:
+				return m.finishDockerBranchSwitchSelect()
 			case wfSvcRestartConfirm:
 				return m.finishRestartPrompt()
 			}
@@ -440,7 +466,7 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 		if err := config.UpdateServiceTag(m.svcName, m.newTag); err != nil {
 			m.log = append(m.log, WarnStyle.Render("  ⚠  impossibile aggiornare last_tag: "+err.Error()))
 		}
-		m.deployed = append(m.deployed, deployedService{name: m.svcName, tag: m.newTag, svc: m.svc})
+		m.deployed = append(m.deployed, deployedService{name: m.svcName, tag: m.newTag, svc: m.svc, dockerBranch: m.dockerBranch})
 		return m.enterRestartPrompt()
 
 	case wfSvcRollback:
@@ -680,6 +706,8 @@ func (m WorkflowModel) startNextService() (tea.Model, tea.Cmd) {
 	m.buildArgQueue = nil
 	m.buildArgIdx = 0
 	m.oldTag = m.svc.LastTag
+	m.dockerBranchChoices = nil
+	m.dockerfileBranches = nil
 	m.newTag = ""
 	m.dockerfilePath = ""
 	m.discovered = false
@@ -760,6 +788,14 @@ func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 			if branch, err := logic.GitCurrentBranch(buildRoot); err == nil && branch != "" {
 				warn = append(warn, "branch del repo Docker: "+branch)
 			}
+			// Where the Dockerfile does exist, read from the refs the clone already
+			// has: the branch to move to is then on screen, not in memory.
+			choices, errChoices := logic.RemoteBranches(buildRoot)
+			found, errFound := logic.BranchesContaining(buildRoot, svc.DockerfileSubpath)
+			if errChoices == nil && errFound == nil && len(choices) > 0 {
+				m.dockerBranchChoices, m.dockerfileBranches = choices, found
+				warn = append(warn, wfBranchHint(found))
+			}
 			m.log = append(m.log, logWarn(warn...)...)
 			return m.enterDockerfileMissing()
 		}
@@ -771,25 +807,189 @@ func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 // enterDockerfileMissing asks what to do about a configured Dockerfile that is
 // not on disk. Cancelling comes first, so the safe answer is preselected.
 func (m WorkflowModel) enterDockerfileMissing() (tea.Model, tea.Cmd) {
+	items := []Item{{Value: "cancel", Label: "Annulla", Desc: "interrompe il deploy senza buildare"}}
+	if len(m.dockerBranchChoices) > 1 && m.canSwitchDockerBranch() {
+		items = append(items, Item{Value: "branch", Label: "Cambia branch",
+			Desc: "riallinea il repo Docker su un altro branch e riprova"})
+	}
+	items = append(items, Item{Value: "scan", Label: "Cerca un Dockerfile",
+		Desc: "l'immagine verrà pushata come " + m.svcName})
+
 	m.state = wfSvcDockerfileMissing
 	m.list = listModel{
 		title: "Dockerfile di " + m.svcName + " non trovato",
-		items: []Item{
-			{Value: "cancel", Label: "Annulla", Desc: "interrompe il deploy senza buildare"},
-			{Value: "scan", Label: "Cerca un Dockerfile", Desc: "l'immagine verrà pushata come " + m.svcName},
-		},
+		items: items,
 		width: m.width,
 	}
 	return m, m.list.Init()
 }
 
 func (m WorkflowModel) finishDockerfileMissing() (tea.Model, tea.Cmd) {
-	if m.list.selected != "scan" {
-		m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.svcName+" non trovato"))
-		m.cancelled = true
-		return m, tea.Quit
+	switch m.list.selected {
+	case "scan":
+		return m.enterDockerfileScan()
+	case "branch":
+		return m.enterDockerBranchSwitchSelect()
 	}
-	return m.enterDockerfileScan()
+	m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.svcName+" non trovato"))
+	m.cancelled = true
+	return m, tea.Quit
+}
+
+// ── Cambio del branch Docker a metà servizio ──────────────────────────────────
+
+// canSwitchDockerBranch reports whether the Docker branch can be changed from
+// the missing-Dockerfile question. hub-cli moves its own clone between branches,
+// never the working copy, which may hold work in progress — so --local-sources
+// never gets the option. In test-ui and dry-run nothing is checked out: the
+// switch is shown, not performed.
+func (m WorkflowModel) canSwitchDockerBranch() bool {
+	switch {
+	case m.localSources || m.cfg.Config.DockerRootPath == "":
+		return false
+	case m.testUI || m.dryRun:
+		return true
+	default:
+		return m.dockerRepoDir != "" && m.dockerURL != ""
+	}
+}
+
+// enterDockerBranchSwitchSelect offers the branches to move the Docker clone
+// to, the ones that have this Dockerfile first — so the first is preselected.
+func (m WorkflowModel) enterDockerBranchSwitchSelect() (tea.Model, tea.Cmd) {
+	current, _ := logic.GitCurrentBranch(m.dockerBuildRoot())
+	m.state = wfSvcDockerBranchSelect
+	m.list = listModel{
+		title: "Branch del repo Docker per " + m.svcName,
+		items: wfBranchChoices(m.dockerBranchChoices, m.dockerfileBranches, current),
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishDockerBranchSwitchSelect() (tea.Model, tea.Cmd) {
+	return m.enterDockerBranchSwitch(m.list.selected)
+}
+
+// enterDockerBranchSwitch moves the Docker clone to branch and retries the
+// Dockerfile. The move holds for the rest of the run — there is one clone, and
+// the services after this one build from wherever it is left — but it is not
+// saved as the next run's default: it answered one service, not the run.
+func (m WorkflowModel) enterDockerBranchSwitch(branch string) (tea.Model, tea.Cmd) {
+	m.switchBranch = branch
+	m.opStart = time.Now()
+
+	if m.dryRun {
+		m.log = append(m.log, wfDryRunLine("git checkout "+branch+" nel repo Docker gestito"))
+		return m.handleDockerSwitchDone(wfDockerSwitchDoneMsg{})
+	}
+
+	m.state = wfSvcDockerBranchSwitch
+	m.spinner = newSpinnerModel("Repo Docker su " + branch)
+	if m.testUI {
+		return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+			time.Sleep(900 * time.Millisecond)
+			return wfDockerSwitchDoneMsg{}
+		})
+	}
+
+	remoteURL, reposRoot := m.dockerURL, config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
+		return wfDockerSwitchDoneMsg{dir: dir, err: err}
+	})
+}
+
+// handleDockerSwitchDone retries the Dockerfile on the branch just checked out.
+// A failed move goes back to the question, so another branch can be tried.
+func (m WorkflowModel) handleDockerSwitchDone(msg wfDockerSwitchDoneMsg) (tea.Model, tea.Cmd) {
+	elapsed := formatElapsed(time.Since(m.opStart))
+	if msg.err != nil {
+		m.log = append(m.log, logFailure("Repo Docker", msg.err, elapsed)...)
+		return m.enterDockerfileMissing()
+	}
+	m.dockerBranch = m.switchBranch
+
+	if m.testUI || m.dryRun {
+		// Nothing was checked out: the Dockerfile is taken as found, the way a
+		// simulated run takes every other step as done.
+		if m.dryRun {
+			elapsed = ""
+		}
+		m.log = append(m.log, logDone("Repo Docker", "origin/"+m.switchBranch+" · simulato", elapsed))
+		m.dockerfilePath = filepath.Join(m.dockerBuildRoot(), m.svc.DockerfileSubpath)
+		m.discovered = false
+		m.log = append(m.log, logInfo("Dockerfile", shortPath(m.dockerfilePath)))
+		return m.enterTagInput()
+	}
+
+	m.dockerRepoDir = msg.dir
+	m.log = append(m.log, logDone("Repo Docker", "origin/"+m.switchBranch, elapsed))
+	return m.enterDockerfileResolve()
+}
+
+// wfBranchChoices lists where the Docker clone can move: the branches with this
+// Dockerfile first, then the others. The branch in use is left out — it is the
+// one that just turned out not to have it.
+func wfBranchChoices(all, containing []string, current string) []Item {
+	has := make(map[string]bool, len(containing))
+	var items []Item
+	for _, b := range containing {
+		if b == current {
+			continue
+		}
+		has[b] = true
+		items = append(items, Item{Value: b, Label: b, Desc: "contiene il Dockerfile"})
+	}
+	for _, b := range all {
+		if b != current && !has[b] {
+			items = append(items, Item{Value: b, Label: b})
+		}
+	}
+	return items
+}
+
+// wfBranchHint says where the missing Dockerfile does exist, so the branch to
+// move to is read off the warning instead of remembered.
+func wfBranchHint(found []string) string {
+	const shown = 3
+	switch {
+	case len(found) == 0:
+		return "non presente in nessun branch di origin"
+	case len(found) <= shown:
+		return "presente su: " + strings.Join(found, ", ")
+	default:
+		return fmt.Sprintf("presente su: %s e altri %d", strings.Join(found[:shown], ", "), len(found)-shown)
+	}
+}
+
+// wfBranchGroup is the share of a manifest sync that goes to one branch.
+type wfBranchGroup struct {
+	branch   string
+	services []deployedService
+}
+
+// wfByDockerBranch splits the manifest sync by the branch each image was built
+// from, in order of first appearance. A service that moved the Docker clone
+// mid-run carries its manifest back there; one with no branch recorded — a
+// simulated run — takes the run's.
+func wfByDockerBranch(deployed []deployedService, fallback string) []wfBranchGroup {
+	var groups []wfBranchGroup
+	index := map[string]int{}
+	for _, d := range deployed {
+		branch := d.dockerBranch
+		if branch == "" {
+			branch = fallback
+		}
+		i, ok := index[branch]
+		if !ok {
+			i = len(groups)
+			index[branch] = i
+			groups = append(groups, wfBranchGroup{branch: branch})
+		}
+		groups[i].services = append(groups[i].services, d)
+	}
+	return groups
 }
 
 // enterDockerfileScan discovers Dockerfiles under the Docker root. What it finds
@@ -1235,7 +1435,7 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting,
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting, wfSvcDockerBranchSwitch,
 		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
 		sb.WriteString(logRunning(m.spinnerFrame(), m.spinner.label,
 			formatElapsed(time.Since(m.opStart))) + "\n")
@@ -1244,7 +1444,7 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString("\n" + m.multisel.View().Content)
 	case wfSvcTagSync:
 		sb.WriteString("\n" + m.confirm.View().Content)
-	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError,
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcHelmError,
 		wfSvcRestartConfirm:
 		sb.WriteString("\n" + m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
@@ -1414,23 +1614,30 @@ func wfRunPostDeploySync(cfg *config.Config, deployed []deployedService, helmBra
 		}
 	}
 
+	// A service can have moved the Docker clone to another branch mid-run: each
+	// manifest goes back to the branch its image was built from, one commit per
+	// branch.
 	if targets := wfManifestTargets(deployed); len(targets) > 0 && cfg.Config.DockerRootPath != "" {
-		ls, err := wfSyncRepo(
-			cfg.Config.DockerRootPath, dockerBranch, reposRoot, message, "manifest k8s",
-			func(dir string) ([]string, error) {
-				var changed []string
-				for _, d := range targets {
-					path := filepath.Join(dir, d.svc.K8sManifestPath)
-					if err := logic.UpdateK8sManifestImage(path, d.svc.K8sImageRef, d.tag); err != nil {
-						return nil, fmt.Errorf("%s: %w", d.name, err)
+		for _, group := range wfByDockerBranch(targets, dockerBranch) {
+			services := group.services
+			ls, err := wfSyncRepo(
+				cfg.Config.DockerRootPath, group.branch, reposRoot,
+				logic.DeployCommitMessageFor(wfDeployedServices(services)), "manifest k8s",
+				func(dir string) ([]string, error) {
+					var changed []string
+					for _, d := range services {
+						path := filepath.Join(dir, d.svc.K8sManifestPath)
+						if err := logic.UpdateK8sManifestImage(path, d.svc.K8sImageRef, d.tag); err != nil {
+							return nil, fmt.Errorf("%s: %w", d.name, err)
+						}
+						changed = append(changed, d.svc.K8sManifestPath)
 					}
-					changed = append(changed, d.svc.K8sManifestPath)
-				}
-				return wfUnique(changed), nil
-			})
-		lines = append(lines, ls...)
-		if err != nil {
-			failures = append(failures, err)
+					return wfUnique(changed), nil
+				})
+			lines = append(lines, ls...)
+			if err != nil {
+				failures = append(failures, err)
+			}
 		}
 	}
 
