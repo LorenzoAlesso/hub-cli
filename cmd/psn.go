@@ -47,6 +47,12 @@ func runPSNWorkflow() error {
 		return err
 	}
 
+	release, err := selectPSNRelease(cluster)
+	if err != nil {
+		return err
+	}
+	printPSNHeader(cfg, cluster, release)
+
 	if cluster.IsProd() && !dryRun {
 		typed, cancelled := ui.RunInput(
 			fmt.Sprintf("Ambiente di PRODUZIONE — digita %q per confermare", cluster.Name),
@@ -69,7 +75,7 @@ func runPSNWorkflow() error {
 		return azErr
 	}
 
-	results, cancelled, err := ui.RunPSNWorkflow(cfg, cluster, dryRun, testUI)
+	results, cancelled, err := ui.RunPSNWorkflow(cfg, cluster, release, dryRun, testUI)
 	if err != nil {
 		return err
 	}
@@ -77,14 +83,7 @@ func runPSNWorkflow() error {
 		return errCancelled
 	}
 
-	if len(results) == 1 {
-		r := results[0]
-		if !r.Skipped {
-			ui.PrintDeploySummary(r.Service, r.OldTag, r.NewTag, r.Elapsed)
-		}
-	} else if len(results) > 1 {
-		ui.PrintMultiDeploySummary(results)
-	}
+	ui.PrintDeploySummary(results)
 	return nil
 }
 
@@ -97,7 +96,7 @@ func selectPSNCluster(cfg *config.Config) (config.PSNClusterConfig, error) {
 			Desc:  psnEnvLabel(c) + " · " + c.AKSName,
 		}
 	}
-	selected, cancelled := ui.RunListItems("Ambiente PSN", items)
+	selected, cancelled := ui.RunListItemsQuiet("Ambiente PSN", items)
 	if cancelled {
 		return config.PSNClusterConfig{}, errCancelled
 	}
@@ -106,6 +105,47 @@ func selectPSNCluster(cfg *config.Config) (config.PSNClusterConfig, error) {
 		return config.PSNClusterConfig{}, fmt.Errorf("selezione cluster non valida")
 	}
 	return cfg.PSN.Clusters[idx], nil
+}
+
+// selectPSNRelease picks which release of the cluster to deploy. It reads only
+// the configuration, so it happens before the Azure phase: that way the header
+// below can name the namespace while the long part of the run is still going.
+func selectPSNRelease(cluster config.PSNClusterConfig) (config.PSNReleaseConfig, error) {
+	releases := cluster.Releases
+	if len(releases) == 0 {
+		ui.PrintErr("Nessun release configurato per " + cluster.Name)
+		ui.PrintInfo("Aggiungere il blocco releases al cluster nel seed (vedi internal/config/seed.example.yaml).")
+		return config.PSNReleaseConfig{}, errCancelled
+	}
+	if len(releases) == 1 {
+		return releases[0], nil
+	}
+
+	items := make([]ui.Item, len(releases))
+	for i, r := range releases {
+		items[i] = ui.Item{Value: r.Name, Label: r.Name, Desc: "namespace " + r.Namespace}
+	}
+	selected, cancelled := ui.RunListItemsQuiet("Release da deployare", items)
+	if cancelled {
+		return config.PSNReleaseConfig{}, errCancelled
+	}
+	for _, r := range releases {
+		if r.Name == selected {
+			return r, nil
+		}
+	}
+	return config.PSNReleaseConfig{}, fmt.Errorf("selezione release non valida")
+}
+
+// printPSNHeader states where the run is going, once, before anything runs.
+func printPSNHeader(cfg *config.Config, cluster config.PSNClusterConfig, release config.PSNReleaseConfig) {
+	details := []string{release.Name, "chart " + release.Chart, release.ChartsBranch}
+	if project := cfg.PSN.ProjectForNamespace(release.Namespace); project != nil {
+		if branch := project.ExpectedBranch(cluster); branch != "" {
+			details = append(details, branch)
+		}
+	}
+	ui.PrintRunHeader("Ambiente PSN: ", cluster.Name, release.Namespace, details)
 }
 
 func psnEnvLabel(c config.PSNClusterConfig) string {
@@ -135,7 +175,7 @@ func runPSNAzurePhase(cfg *config.Config, cluster config.PSNClusterConfig) (kube
 	}
 
 	if logic.AZIsLoggedIn() {
-		ui.PrintOK("Sessione Azure attiva.")
+		ui.PrintStepDone("Sessione Azure", "", "attiva")
 	} else {
 		ui.PrintRunning("az login in corso (browser)...")
 		if err := logic.AZLogin(cfg.PSN.TenantID); err != nil {
@@ -143,7 +183,7 @@ func runPSNAzurePhase(cfg *config.Config, cluster config.PSNClusterConfig) (kube
 		}
 	}
 
-	if err := ui.RunSpinner("az account set", func(out io.Writer) error {
+	if err := ui.RunSpinner("Subscription", func(out io.Writer) error {
 		return logic.AZSetSubscription(cluster.SubscriptionID)
 	}); err != nil {
 		// The active session may belong to another tenant: retry once after
@@ -152,21 +192,21 @@ func runPSNAzurePhase(cfg *config.Config, cluster config.PSNClusterConfig) (kube
 		if err := logic.AZLogin(cfg.PSN.TenantID); err != nil {
 			return false, err
 		}
-		if err := ui.RunSpinner("az account set", func(out io.Writer) error {
+		if err := ui.RunSpinner("Subscription", func(out io.Writer) error {
 			return logic.AZSetSubscription(cluster.SubscriptionID)
 		}); err != nil {
 			return false, err
 		}
 	}
 
-	if err := ui.RunSpinner("az aks get-credentials", func(out io.Writer) error {
+	if err := ui.RunSpinner("Credenziali del cluster", func(out io.Writer) error {
 		return logic.AZGetAKSCredentials(cluster.ResourceGroup, cluster.AKSName, out)
 	}); err != nil {
 		return false, err
 	}
 
 	// From here kubectl points at the PSN cluster.
-	if err := ui.RunSpinner("az acr login", func(out io.Writer) error {
+	if err := ui.RunSpinner("Login al registry", func(out io.Writer) error {
 		return logic.ACRLogin(cluster.ACRName, out)
 	}); err != nil {
 		return true, err

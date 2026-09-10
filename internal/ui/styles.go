@@ -50,13 +50,11 @@ var (
 	CursorStyle = lipgloss.NewStyle().
 			Foreground(Accent)
 
+	// The help line carries the grid margin itself: a prompt written
+	// later cannot leave it at column zero under its own frame.
 	HelpStyle = lipgloss.NewStyle().
 			Foreground(Muted).
-			MarginTop(1)
-
-	StepDoneStyle    = lipgloss.NewStyle().Foreground(Success)
-	StepActiveStyle  = lipgloss.NewStyle().Foreground(Accent).Bold(true)
-	StepPendingStyle = lipgloss.NewStyle().Foreground(Muted)
+			MarginTop(1).MarginLeft(2)
 
 	SectionStyle = lipgloss.NewStyle().
 			Foreground(Accent).
@@ -80,10 +78,7 @@ func rebuildStyles() {
 	SelectedItemStyle = lipgloss.NewStyle().Foreground(Accent).Bold(true)
 	ItemStyle = lipgloss.NewStyle().Foreground(White)
 	CursorStyle = lipgloss.NewStyle().Foreground(Accent)
-	HelpStyle = lipgloss.NewStyle().Foreground(Muted).MarginTop(1)
-	StepDoneStyle = lipgloss.NewStyle().Foreground(Success)
-	StepActiveStyle = lipgloss.NewStyle().Foreground(Accent).Bold(true)
-	StepPendingStyle = lipgloss.NewStyle().Foreground(Muted)
+	HelpStyle = lipgloss.NewStyle().Foreground(Muted).MarginTop(1).MarginLeft(2)
 	SectionStyle = lipgloss.NewStyle().Foreground(Accent).Bold(true).MarginTop(1)
 	DimStyle = lipgloss.NewStyle().Foreground(Muted)
 	SecondaryStyle = lipgloss.NewStyle().Foreground(Secondary).Bold(true)

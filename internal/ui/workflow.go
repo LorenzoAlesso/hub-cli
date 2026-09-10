@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -125,6 +126,8 @@ type WorkflowModel struct {
 	deployed      []deployedService // services that reached the cluster, for the final commit
 	syncErr       error
 	restartTarget string // Deployment to restart when the tag did not change
+	restarted     bool   // the service in hand had its pod recreated
+	svcLogStart   int    // where the header of the service in hand sits in the log
 
 	results []DeployResult
 }
@@ -165,7 +168,34 @@ func RunWorkflow(cfg *config.Config, dryRun, testUI, localSources bool) ([]Deplo
 		return nil, false, nil, err
 	}
 	wf := final.(WorkflowModel)
+	SetSummaryContext("Locale  ·  "+cfg.Config.ECRRegion, wf.summaryFooter())
 	return wf.results, wf.cancelled, wf.syncErr, nil
+}
+
+// summaryFooter is the line under the closing table: one upgrade per service
+// here, unlike PSN, and where the tags were written back.
+func (m WorkflowModel) summaryFooter() string {
+	label := "servizi"
+	if len(m.results) == 1 {
+		label = "servizio"
+	}
+	parts := []string{fmt.Sprintf("%d %s", len(m.results), label)}
+	if n := len(m.deployed); n > 0 {
+		revisions := "revisioni helm"
+		if n == 1 {
+			revisions = "revisione helm"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", n, revisions))
+	}
+	switch {
+	case m.localSources:
+		parts = append(parts, "sync saltato")
+	case m.syncErr != nil:
+		parts = append(parts, "sync non riuscito")
+	case len(m.deployed) > 0 && m.helmBranch != "" && !m.dryRun && !m.testUI:
+		parts = append(parts, "values su "+m.helmBranch)
+	}
+	return strings.Join(parts, "  ·  ")
 }
 
 // helmValuesRoot is the directory the values file is read from: the managed
@@ -242,9 +272,8 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.helmRepoDir = rp.dir
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
-			"  Values da origin/"+m.helmBranch+"  ")+
-			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
+		m.log = append(m.log, logDone("Values", "origin/"+m.helmBranch,
+			formatElapsed(time.Since(m.opStart))))
 		return m.enterDockerBranchLoading()
 	}
 	if bl, ok := msg.(wfDockerBranchesLoadedMsg); ok {
@@ -263,9 +292,8 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.dockerRepoDir = rp.dir
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
-			"  Dockerfile da origin/"+m.dockerBranch+"  ")+
-			ValueStyle.Render(formatElapsed(time.Since(m.opStart))))
+		m.log = append(m.log, logDone("Dockerfile", "origin/"+m.dockerBranch,
+			formatElapsed(time.Since(m.opStart))))
 		return m.enterServiceSelect()
 	}
 	if ps, ok := msg.(wfPostSyncDoneMsg); ok {
@@ -359,36 +387,32 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		switch m.state {
 		case wfECRLogin:
-			m.log = append(m.log, ErrStyle.Render("  ✗  ECR Login — "+msg.err.Error()))
-			if len(msg.output) > 0 {
-				m.log = append(m.log, DimStyle.Render(string(msg.output)))
-			}
+			m.log = append(m.log, logFailure("ECR Login", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case wfSvcBuilding:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Docker Build fallito"))
-			if len(msg.output) > 0 {
-				m.log = append(m.log, DimStyle.Render(string(msg.output)))
-			}
+			m.log = append(m.log, logFailure("Build", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case wfSvcPushing:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Docker Push fallito"))
+			m.log = append(m.log, logFailure("Push", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case wfSvcHelm:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Helm Upgrade fallito: "+msg.err.Error()))
+			m.log = append(m.log, logFailure("helm upgrade", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m.enterHelmError()
 		case wfSvcRollback:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Rollback fallito: "+msg.err.Error()))
+			m.log = append(m.log, logFailure("Rollback", msg.err, elapsed)...)
 			m.cancelled = true
 			return m, tea.Quit
 		case wfSvcRestarting:
 			// The upgrade already landed, so the service counts as deployed:
 			// only the restart failed.
-			m.log = append(m.log, ErrStyle.Render("  ✗  Riavvio non riuscito: "+msg.err.Error()))
-			if len(msg.output) > 0 {
-				m.log = append(m.log, DimStyle.Render(string(msg.output)))
-			}
-			m.log = append(m.log, WarnStyle.Render(
-				"      Il pod potrebbe girare ancora l'immagine precedente: verificare sul cluster."))
+			m.log = append(m.log, logFailure("Riavvio", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
+			m.log = append(m.log, logWarn(
+				"Il pod potrebbe girare ancora l'immagine precedente: verificare sul cluster.")...)
 			return m.finishService()
 		}
 	}
@@ -403,15 +427,15 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 		return m.enterBranchLoading()
 
 	case wfSvcBuilding:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Build  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logDone("Build", "", elapsed))
 		return m.enterPush()
 
 	case wfSvcPushing:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Push  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logDone("Push", "", elapsed))
 		return m.enterHelm()
 
 	case wfSvcHelm:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Deploy  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logDone("helm upgrade", m.svc.ReleaseName, elapsed))
 		// Save tag synchronously (fast file write)
 		if err := config.UpdateServiceTag(m.svcName, m.newTag); err != nil {
 			m.log = append(m.log, WarnStyle.Render("  ⚠  impossibile aggiornare last_tag: "+err.Error()))
@@ -425,8 +449,8 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case wfSvcRestarting:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render(
-			"  Riavvio di "+m.restartTarget+"  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logStep("↻", CursorStyle, "Riavvio "+m.restartTarget, "tag invariato", elapsed))
+		m.markRestarted()
 		return m.finishService()
 	}
 	return m, nil
@@ -662,10 +686,12 @@ func (m WorkflowModel) startNextService() (tea.Model, tea.Cmd) {
 
 	SetStatus(m.svcName, m.cfg.Config.ECRRegion)
 
-	if len(m.selectedServices) > 1 {
-		m.log = append(m.log, "\n"+SectionStyle.Render(fmt.Sprintf(
-			"── Servizio [%d/%d]: %s", m.svcIdx+1, len(m.selectedServices), strings.ToUpper(m.svcName))))
-	}
+	// The service opens with its header straight away, so everything logged for
+	// it lands underneath — a missing Dockerfile included, which is resolved here
+	// before the tag is asked. The tag half is filled in once chosen: the view
+	// redraws the log every frame, so the line updates where it stands.
+	m.svcLogStart = len(m.log)
+	m.log = append(m.log, m.serviceHeader(), logInfo("Immagine", m.svc.ECRRepository+":"+m.oldTag))
 
 	// Tag sync (synchronous kubectl get — typically fast)
 	if !m.testUI && m.svc.ReleaseName != "" && m.svc.Namespace != "" && m.svc.HelmSetKey != "" {
@@ -704,6 +730,8 @@ func (m WorkflowModel) finishTagSync() (tea.Model, tea.Cmd) {
 		} else {
 			m.svc.LastTag = deployedTag
 			m.oldTag = deployedTag
+			m.log[m.svcLogStart] = m.serviceHeader()
+			m.log[m.svcLogStart+1] = logInfo("Immagine", m.svc.ECRRepository+":"+m.oldTag)
 			m.log = append(m.log, SuccessStyle.Render(fmt.Sprintf(`  ✓  last_tag aggiornato a %q`, deployedTag)))
 		}
 	}
@@ -723,15 +751,16 @@ func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 			if _, err := os.Stat(abs); err == nil {
 				m.dockerfilePath = abs
 				m.discovered = false
-				m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+abs))
+				m.log = append(m.log, logInfo("Dockerfile", shortPath(abs)))
 				return m.enterTagInput()
 			}
 			// A configured path that is missing usually means the repo is on a
 			// branch without this service, so scanning is the user's decision.
-			m.log = append(m.log, WarnStyle.Render("  ⚠  Dockerfile configurato non trovato: "+abs))
+			warn := []string{"Dockerfile configurato non trovato", shortPath(abs)}
 			if branch, err := logic.GitCurrentBranch(buildRoot); err == nil && branch != "" {
-				m.log = append(m.log, WarnStyle.Render("      branch corrente del repo Docker: "+branch))
+				warn = append(warn, "branch del repo Docker: "+branch)
 			}
+			m.log = append(m.log, logWarn(warn...)...)
 			return m.enterDockerfileMissing()
 		}
 	}
@@ -746,8 +775,8 @@ func (m WorkflowModel) enterDockerfileMissing() (tea.Model, tea.Cmd) {
 	m.list = listModel{
 		title: "Dockerfile di " + m.svcName + " non trovato",
 		items: []Item{
-			{Value: "cancel", Label: "Annulla  — interrompe il deploy senza buildare"},
-			{Value: "scan", Label: "Cerca comunque un Dockerfile", Desc: "l'immagine verrà pushata come " + m.svcName},
+			{Value: "cancel", Label: "Annulla", Desc: "interrompe il deploy senza buildare"},
+			{Value: "scan", Label: "Cerca un Dockerfile", Desc: "l'immagine verrà pushata come " + m.svcName},
 		},
 		width: m.width,
 	}
@@ -777,7 +806,7 @@ func (m WorkflowModel) enterDockerfileScan() (tea.Model, tea.Cmd) {
 			searchRoot = projectDir
 		}
 	}
-	m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  Scansione Dockerfile in %s...", searchRoot)))
+	m.log = append(m.log, logInfo("Scansione", shortPath(searchRoot)))
 
 	files, err := logic.FindDockerfiles(searchRoot)
 	if err != nil || len(files) == 0 && searchRoot != buildRoot {
@@ -817,7 +846,7 @@ func wfDockerfileListTitle(serviceName, ecrRepository string) string {
 func (m WorkflowModel) finishDockerfile() (tea.Model, tea.Cmd) {
 	m.dockerfilePath = m.list.selected
 	m.discovered = true
-	m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+m.dockerfilePath))
+	m.log = append(m.log, logInfo("Dockerfile", shortPath(m.dockerfilePath)))
 	return m.enterTagInput()
 }
 
@@ -842,6 +871,12 @@ func (m WorkflowModel) enterTagInput() (tea.Model, tea.Cmd) {
 	return m, m.input.Init()
 }
 
+// serviceHeader renders the header of the service in hand. Its tag half stays
+// pending until the tag is chosen.
+func (m WorkflowModel) serviceHeader() string {
+	return logServiceHeader(m.svcIdx+1, len(m.selectedServices), m.svcName, m.oldTag, m.newTag)
+}
+
 func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	val := m.input.textInput.Value()
 	if val == "" {
@@ -861,19 +896,20 @@ func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.log = append(m.log, wfTagCard(m.svcName, m.oldTag, m.newTag))
+	m.log[m.svcLogStart] = m.serviceHeader()
 
 	// Same tag, same rendered manifest: Kubernetes sees no change and keeps the
-	// pod as it is, so the image just pushed never starts on its own.
+	// pod as it is, so the image just pushed never starts on its own. The warning
+	// goes right under the header it qualifies, ahead of whatever the Dockerfile
+	// resolution logged in the meantime.
 	if m.newTag == m.oldTag {
-		m.log = append(m.log, WarnStyle.Render(
-			"  ⚠  Tag invariato: l'immagine viene sovrascritta, ma il manifest resta identico"))
-		m.log = append(m.log, WarnStyle.Render(
-			"      e il pod non viene ricreato. Serve un rollout restart, oppure un tag nuovo."))
+		m.log = slices.Insert(m.log, m.svcLogStart+1, logWarn(
+			"Il manifest non cambia: il pod non riparte da solo.",
+			"A fine deploy hub-cli propone il riavvio.")...)
 	}
 
 	if dockerArgs, err := logic.ParseDockerfileArgs(m.dockerfilePath); err == nil && len(dockerArgs) > 0 {
-		m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  %d build ARG rilevati nel Dockerfile", len(dockerArgs))))
+		m.log = append(m.log, logInfo("Build ARG", fmt.Sprintf("%d rilevati nel Dockerfile", len(dockerArgs))))
 		m.buildArgQueue = dockerArgs
 		m.buildArgIdx = 0
 		return m.enterBuildArg()
@@ -907,6 +943,10 @@ func (m WorkflowModel) finishBuildArg() (tea.Model, tea.Cmd) {
 // ── Build ─────────────────────────────────────────────────────────────────────
 
 func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
+	// A blank line between what the service is and what is being done to it:
+	// the facts above are context, everything below is the pipeline running.
+	m.log = append(m.log, "")
+
 	m.valuesPath = filepath.Join(m.helmValuesRoot(), m.svc.HelmValuesPath)
 	m.chartVersion = m.svc.ChartVersion
 	if m.chartVersion == "" {
@@ -1012,11 +1052,12 @@ func (m WorkflowModel) enterHelm() (tea.Model, tea.Cmd) {
 func (m WorkflowModel) enterHelmError() (tea.Model, tea.Cmd) {
 	m.state = wfSvcHelmError
 	m.list = listModel{
-		title: "Cosa vuoi fare?",
+		errorTone: true,
+		title:     "Cosa vuoi fare?",
 		items: []Item{
-			{Value: "retry", Label: "Riprova — esegui 'helm repo update' poi riprova"},
-			{Value: "rollback", Label: "Rollback — rimuove l'immagine da ECR e annulla"},
-			{Value: "cancel", Label: "Annulla  — esce senza deploy (immagine resta su ECR)"},
+			{Value: "retry", Label: "Riprova", Desc: "esegue 'helm repo update' e riprova"},
+			{Value: "rollback", Label: "Rollback", Desc: "rimuove l'immagine da ECR e annulla"},
+			{Value: "cancel", Label: "Annulla", Desc: "esce senza deploy, l'immagine resta su ECR"},
 		},
 		width: m.width,
 	}
@@ -1061,8 +1102,7 @@ func (m WorkflowModel) enterPostSync() (tea.Model, tea.Cmd) {
 	if m.localSources {
 		// The cluster runs a values file that exists in no commit: the tag on
 		// the shared branch would describe an unreproducible state.
-		m.log = append(m.log, WarnStyle.Render(
-			"  ⚠  Sync saltato: deploy di prova dalle copie di lavoro"))
+		m.log = append(m.log, logWarn("Sync saltato: deploy di prova dalle copie di lavoro")...)
 		return m.enterSummary()
 	}
 	if m.dryRun || m.testUI {
@@ -1127,9 +1167,9 @@ func (m WorkflowModel) enterRestartPrompt() (tea.Model, tea.Cmd) {
 	m.list = listModel{
 		title: "Tag invariato per " + target + " — riavviare?",
 		items: []Item{
-			{Value: "restart", Label: "Riavvia  — rollout restart, il pod riparte con l'immagine appena pushata",
-				Desc: "per qualche decina di secondi girano due istanze insieme"},
-			{Value: "skip", Label: "Salta  — il pod continua a girare l'immagine precedente"},
+			{Value: "restart", Label: "Riavvia",
+				Desc: "rollout restart; per qualche decina di secondi girano due istanze"},
+			{Value: "skip", Label: "Salta", Desc: "il pod continua a girare l'immagine precedente"},
 		},
 		width: m.width,
 	}
@@ -1159,13 +1199,22 @@ func (m WorkflowModel) finishRestartPrompt() (tea.Model, tea.Cmd) {
 	})
 }
 
+// markRestarted records that the service in hand was redeployed under the same
+// tag and had its pod recreated. Its result is appended by finishService right
+// after, so the flag is carried on the model until then.
+func (m *WorkflowModel) markRestarted() {
+	m.restarted = true
+}
+
 func (m WorkflowModel) finishService() (tea.Model, tea.Cmd) {
 	m.results = append(m.results, DeployResult{
-		Service: m.svcName,
-		OldTag:  m.oldTag,
-		NewTag:  m.newTag,
-		Elapsed: time.Since(m.svcStart),
+		Service:   m.svcName,
+		OldTag:    m.oldTag,
+		NewTag:    m.newTag,
+		Elapsed:   time.Since(m.svcStart),
+		Restarted: m.restarted,
 	})
+	m.restarted = false
 	m.svcIdx++
 	return m.startNextService()
 }
@@ -1188,17 +1237,18 @@ func (m WorkflowModel) View() tea.View {
 	switch m.state {
 	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting,
 		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
-		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
-		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinnerFrame(), elapsed))
+		sb.WriteString(logRunning(m.spinnerFrame(), m.spinner.label,
+			formatElapsed(time.Since(m.opStart))) + "\n")
+	// A question stands off the log it interrupts, instead of continuing it.
 	case wfServiceSelect:
-		sb.WriteString(m.multisel.View().Content)
+		sb.WriteString("\n" + m.multisel.View().Content)
 	case wfSvcTagSync:
-		sb.WriteString(m.confirm.View().Content)
+		sb.WriteString("\n" + m.confirm.View().Content)
 	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcHelmError,
 		wfSvcRestartConfirm:
-		sb.WriteString(m.list.View().Content)
+		sb.WriteString("\n" + m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
-		sb.WriteString(m.input.View().Content)
+		sb.WriteString("\n" + m.input.View().Content)
 	case wfSummary:
 		w := m.width
 		if w == 0 {
@@ -1214,59 +1264,53 @@ func (m WorkflowModel) View() tea.View {
 // ── Step tracker (tab bar) ────────────────────────────────────────────────────
 
 func (m WorkflowModel) renderStepTracker() string {
-	var sb strings.Builder
-	sb.WriteString("\n")
+	frame := m.spinnerFrame()
+	inPipeline := m.state >= wfSvcTagSync && m.state < wfPostSync
 
-	// Tab ECR Login
-	var ecrTab string
+	tabs := []string{}
 	if m.state == wfECRLogin {
-		ecrTab = m.spinnerFrame() + " " + ValueStyle.Render("ECR")
+		tabs = append(tabs, trackerTab(trackSpinning, "ECR", frame))
 	} else {
-		ecrTab = SuccessStyle.Render("✓ ECR")
+		tabs = append(tabs, trackerTab(trackDone, "ECR", frame))
 	}
 
-	// Tab Selezione Servizi
-	var svcTab string
 	switch {
 	case m.state < wfServiceSelect:
-		svcTab = DimStyle.Render("· Servizi")
+		tabs = append(tabs, trackerTab(trackPending, "Servizi", frame))
 	case m.state == wfServiceSelect:
-		svcTab = CursorStyle.Render("▸") + " " + ValueStyle.Render("Servizi")
+		tabs = append(tabs, trackerTab(trackInteractive, "Servizi", frame))
 	default:
-		svcTab = SuccessStyle.Render("✓ Servizi")
+		tabs = append(tabs, trackerTab(trackDone, "Servizi", frame))
 	}
 
-	// Tab Pipeline
-	inPipeline := m.state >= wfSvcTagSync
-	var pipeTab string
-	if !inPipeline {
-		pipeTab = DimStyle.Render("· Pipeline")
-	} else {
-		total := len(m.selectedServices)
-		cur := m.svcIdx + 1
-		if cur > total {
-			cur = total
-		}
-		pipeTab = CursorStyle.Render("▸") + "  " +
-			ValueStyle.Render(fmt.Sprintf("Pipeline [%d/%d]", cur, total)) +
-			"  " + SelectedItemStyle.Render(strings.ToUpper(m.svcName))
+	pipeline := fmt.Sprintf("Pipeline [%d/%d]", min(m.svcIdx+1, len(m.selectedServices)), len(m.selectedServices))
+	switch {
+	case m.state < wfSvcTagSync:
+		tabs = append(tabs, trackerTab(trackPending, "Pipeline", frame))
+	case inPipeline:
+		tabs = append(tabs, trackerTab(trackInteractive, pipeline, frame))
+	default:
+		tabs = append(tabs, trackerTab(trackDone, pipeline, frame))
 	}
 
-	div := DimStyle.Render("   │   ")
-	sb.WriteString("  " + ecrTab + div + svcTab + div + pipeTab + "\n")
-
-	// Separatore orizzontale
-	w := m.width
-	if w == 0 {
-		w = 80
+	// The sync is one commit for the whole run, so it belongs to this row and
+	// not to the per-service one below.
+	switch {
+	case m.state >= wfSummary:
+		tabs = append(tabs, trackerTab(trackDone, "Sync", frame))
+	case m.state == wfPostSync:
+		tabs = append(tabs, trackerTab(trackSpinning, "Sync", frame))
+	default:
+		tabs = append(tabs, trackerTab(trackPending, "Sync", frame))
 	}
-	sb.WriteString(DimStyle.Render("  "+strings.Repeat("─", w-4)) + "\n")
 
-	// Sub-stages (solo in pipeline)
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(trackerRow(tabs) + "\n")
+	sb.WriteString(trackerRule(m.width) + "\n")
 	if inPipeline {
-		sb.WriteString("    " + m.renderPipelineStages() + "\n")
+		sb.WriteString(m.renderPipelineStages() + "\n")
 	}
-
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -1275,116 +1319,53 @@ func (m WorkflowModel) spinnerFrame() string {
 	return m.spinner.spinner.View()
 }
 
+// renderPipelineStages is the row of the service being deployed. Deploy stays
+// here, unlike PSN: the local workflow upgrades one release per service.
 func (m WorkflowModel) renderPipelineStages() string {
-	type stStatus int
-	const (
-		stPending stStatus = iota
-		stInteractive
-		stSpinning
-		stFailed
-		stDone
-	)
-
-	asyncStatus := func(activeAt, doneAt wfState) stStatus {
-		if m.state >= doneAt {
-			return stDone
-		}
-		if m.state == activeAt {
-			return stSpinning
-		}
-		return stPending
-	}
-
-	configStatus := func() stStatus {
-		if m.state >= wfSvcBuilding {
-			return stDone
-		}
-		switch m.state {
-		case wfSvcTagSync, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcTagInput, wfSvcBuildArg:
-			return stInteractive
-		}
-		return stPending
-	}
-
-	deployStatus := func() stStatus {
-		if m.state >= wfPostSync {
-			return stDone
-		}
-		if m.state == wfSvcHelm || m.state == wfSvcRollback || m.state == wfSvcRestarting {
-			return stSpinning
-		}
-		if m.state == wfSvcRestartConfirm {
-			return stInteractive
-		}
-		if m.state == wfSvcHelmError {
-			return stFailed
-		}
-		return stPending
-	}
-
-	type stageEntry struct {
-		label  string
-		status stStatus
-	}
-	stages := []stageEntry{
-		{"Config", configStatus()},
-		{"Build", asyncStatus(wfSvcBuilding, wfSvcPushing)},
-		{"Push", asyncStatus(wfSvcPushing, wfSvcHelm)},
-		{"Deploy", deployStatus()},
-		{"Sync", asyncStatus(wfPostSync, wfSummary)},
-	}
-
 	frame := m.spinnerFrame()
-	var parts []string
-	for _, s := range stages {
-		var indicator, lbl string
-		switch s.status {
-		case stDone:
-			indicator = SuccessStyle.Render("✓")
-			lbl = DimStyle.Render(s.label)
-		case stSpinning:
-			indicator = frame
-			lbl = ValueStyle.Render(s.label)
-		case stInteractive:
-			indicator = CursorStyle.Render("▸")
-			lbl = ValueStyle.Render(s.label)
-		case stFailed:
-			indicator = ErrStyle.Render("✗")
-			lbl = ErrStyle.Render(s.label)
-		default:
-			indicator = DimStyle.Render("·")
-			lbl = DimStyle.Render(s.label)
-		}
-		parts = append(parts, indicator+" "+lbl)
+
+	config := trackPending
+	switch {
+	case m.state >= wfSvcBuilding:
+		config = trackDone
+	case m.state >= wfSvcTagSync:
+		config = trackInteractive
 	}
 
-	sep := DimStyle.Render("  →  ")
-	var out strings.Builder
-	for i, p := range parts {
-		if i > 0 {
-			out.WriteString(sep)
+	async := func(activeAt, doneAt wfState) trackerState {
+		switch {
+		case m.state >= doneAt:
+			return trackDone
+		case m.state == activeAt:
+			return trackSpinning
 		}
-		out.WriteString(p)
+		return trackPending
 	}
-	return out.String()
+
+	deploy := trackPending
+	switch {
+	case m.state >= wfPostSync:
+		deploy = trackDone
+	case m.state == wfSvcHelmError:
+		deploy = trackFailed
+	case m.state == wfSvcRestartConfirm:
+		deploy = trackInteractive
+	case m.state == wfSvcHelm || m.state == wfSvcRollback || m.state == wfSvcRestarting:
+		deploy = trackSpinning
+	}
+
+	return stageRow(m.svcName, []string{
+		trackerTab(config, "Config", frame),
+		trackerTab(async(wfSvcBuilding, wfSvcPushing), "Build", frame),
+		trackerTab(async(wfSvcPushing, wfSvcHelm), "Push", frame),
+		trackerTab(deploy, "Deploy", frame),
+	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func wfDryRunLine(msg string) string {
 	return SecondaryStyle.Render("  ◆ DRY-RUN") + "  " + DimStyle.Render(msg)
-}
-
-// wfTagCard is the log entry announcing the tag a service goes out with. The
-// blank line on each side frames it as a break in the log rather than as a
-// heading for the lines that follow.
-func wfTagCard(serviceName, oldTag, newTag string) string {
-	content := fmt.Sprintf("  %s    %s  →  %s  ",
-		SelectedItemStyle.Render(serviceName),
-		DimStyle.Render(oldTag),
-		SuccessStyle.Render(newTag),
-	)
-	return "\n" + BoxStyle.Render(content) + "\n"
 }
 
 func wfProjectPrefix(serviceName string) string {
@@ -1462,17 +1443,15 @@ func wfSyncRepo(workingCopy, branch, reposRoot, message, label string,
 
 	remoteURL, err := logic.GitRemoteURL(workingCopy)
 	if err != nil {
-		return []string{ErrStyle.Render("  ✗  Sync " + label + " non riuscito: " + err.Error())}, err
+		return logFailure("Sync "+label, err, ""), err
 	}
 
 	if err := logic.SyncToBranch(remoteURL, branch, reposRoot, message, apply, nil); err != nil {
-		return []string{
-			ErrStyle.Render("  ✗  Sync " + label + " non riuscito: " + err.Error()),
-			WarnStyle.Render("      Il branch " + branch + " non riflette più lo stato del cluster."),
-		}, err
+		lines := logFailure("Sync "+label, err, "")
+		return append(lines, logWarn("Il branch "+branch+" non riflette più lo stato del cluster.")...), err
 	}
 
-	return []string{SuccessStyle.Render("  ✓  Sync " + label + ": commit e push su " + branch)}, nil
+	return []string{logDone("Sync "+label, branch, "")}, nil
 }
 
 func wfDeployedServices(deployed []deployedService) []logic.DeployedService {

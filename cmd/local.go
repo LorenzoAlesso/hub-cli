@@ -55,14 +55,7 @@ func runLocalWorkflow() error {
 		return errCancelled
 	}
 
-	if len(results) == 1 {
-		r := results[0]
-		if !r.Skipped {
-			ui.PrintDeploySummary(r.Service, r.OldTag, r.NewTag, r.Elapsed)
-		}
-	} else if len(results) > 1 {
-		ui.PrintMultiDeploySummary(results)
-	}
+	ui.PrintDeploySummary(results)
 
 	// Not a failure of the run — the deploy reached the cluster — but the
 	// repository no longer describes what is running.

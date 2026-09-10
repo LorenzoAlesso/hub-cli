@@ -42,6 +42,65 @@ type listModel struct {
 	quit     bool
 	width    int
 	filter   string
+
+	// errorTone frames the list in the error colour: the same question shape,
+	// asked because something broke rather than because the workflow reached a
+	// fork.
+	errorTone bool
+
+	// quiet drops the echo of the answer, for a choice that whatever prints next
+	// restates in full.
+	quiet bool
+}
+
+// borderStyle is the colour of the frame, which says who is asking.
+func (m listModel) borderStyle() lipgloss.Style {
+	if m.errorTone {
+		return ErrStyle
+	}
+	return CursorStyle
+}
+
+// itemLines renders the entries of a list. The description sits on the same row
+// as its label when the pair fits the terminal, and drops to its own indented
+// row when it does not — a decision with a long explanation would otherwise
+// push the frame off screen.
+func itemLines(items []Item, cursor, offset, width int) []string {
+	labelW, descW := 0, 0
+	for _, it := range items {
+		labelW = max(labelW, lipgloss.Width(it.Label))
+		descW = max(descW, lipgloss.Width(it.Desc))
+	}
+
+	limit := width - 10
+	if limit <= 0 || limit > 96 {
+		limit = 96
+	}
+	inline := descW == 0 || 6+labelW+descW <= limit
+
+	var lines []string
+	for i, it := range items {
+		cur := " "
+		label := ItemStyle.Render(it.Label)
+		if offset+i == cursor {
+			cur = CursorStyle.Render(">")
+			label = SelectedItemStyle.Render(it.Label)
+		}
+
+		if it.Desc == "" {
+			lines = append(lines, fmt.Sprintf("%s %s", cur, label))
+			continue
+		}
+		if inline {
+			gap := strings.Repeat(" ", labelW-lipgloss.Width(it.Label)+2)
+			lines = append(lines, fmt.Sprintf("%s %s%s%s", cur, label, gap, DimStyle.Render(it.Desc)))
+			continue
+		}
+		lines = append(lines,
+			fmt.Sprintf("%s %s", cur, label),
+			"    "+DimStyle.Render(it.Desc))
+	}
+	return lines
 }
 
 // listWindow caps how many entries are drawn at once. Some lists are long — a
@@ -141,6 +200,9 @@ func (m listModel) View() tea.View {
 	visible := m.matches()
 
 	if m.done {
+		if m.quiet {
+			return tea.NewView("")
+		}
 		label := ""
 		if m.cursor < len(visible) {
 			label = visible[m.cursor].Label
@@ -152,75 +214,39 @@ func (m listModel) View() tea.View {
 		))
 	}
 
-	title := TitleStyle.Render(m.title)
+	title := SelectedItemStyle.Render(m.title)
 	if m.filter != "" {
 		title += DimStyle.Render(fmt.Sprintf("  (filtro: %s — %d di %d)",
 			m.filter, len(visible), len(m.items)))
 	}
 
 	var sb strings.Builder
-	sb.WriteString(title + "\n\n")
 
 	if len(visible) == 0 {
-		sb.WriteString(BoxStyle.Render(WarnStyle.Render("nessuna voce per " + m.filter)))
+		sb.WriteString(questionBox(title, m.borderStyle(),
+			[]string{WarnStyle.Render("nessuna voce per " + m.filter)}))
 		sb.WriteString("\n" + HelpStyle.Render("digita per filtrare · backspace cancella · esc azzera il filtro"))
 		return tea.NewView(sb.String())
 	}
 
 	start, end, above, below := listSlice(len(visible), m.cursor)
-	window := visible[start:end]
-
-	// Compute the label column width so descriptions line up.
-	maxLen := 0
-	for _, item := range window {
-		if len(item.Label) > maxLen {
-			maxLen = len(item.Label)
-		}
-	}
-
-	lines := make([]string, len(window))
-	for i, item := range window {
-		padding := strings.Repeat(" ", maxLen-len(item.Label)+2)
-		var desc string
-		if item.Desc != "" {
-			desc = lipgloss.NewStyle().Foreground(Muted).Render("· " + item.Desc)
-		}
-
-		cur := " "
-		if start+i == m.cursor {
-			cur = CursorStyle.Render(">")
-		}
-
-		label := ItemStyle.Render(item.Label)
-		if start+i == m.cursor {
-			label = SelectedItemStyle.Render(item.Label)
-		}
-
-		lines[i] = fmt.Sprintf("  %s %s%s%s", cur, label, padding, desc)
-	}
+	lines := itemLines(visible[start:end], m.cursor, start, m.width)
 
 	if above > 0 {
-		lines = append([]string{DimStyle.Render(fmt.Sprintf("    ↑ altre %d", above))}, lines...)
+		lines = append([]string{DimStyle.Render(fmt.Sprintf("  ↑ altre %d", above))}, lines...)
 	}
 	if below > 0 {
-		lines = append(lines, DimStyle.Render(fmt.Sprintf("    ↓ altre %d", below)))
+		lines = append(lines, DimStyle.Render(fmt.Sprintf("  ↓ altre %d", below)))
 	}
 
-	// Normalize all line widths so the box border never shifts on hover.
-	maxWidth := 0
-	for _, line := range lines {
-		if w := lipgloss.Width(line); w > maxWidth {
-			maxWidth = w
-		}
+	sb.WriteString(questionBox(title, m.borderStyle(), lines))
+	// The filter is only worth announcing on a list long enough to need it: on a
+	// two-way decision it reads as an option the question does not have.
+	help := "↑/↓ naviga · enter seleziona · esc annulla"
+	if len(m.items) > listWindow/2 {
+		help = "↑/↓ naviga · digita per filtrare · enter seleziona · esc annulla"
 	}
-	for i, line := range lines {
-		if w := lipgloss.Width(line); w < maxWidth {
-			lines[i] = line + strings.Repeat(" ", maxWidth-w)
-		}
-	}
-
-	sb.WriteString(BoxStyle.Render(strings.Join(lines, "\n")))
-	sb.WriteString("\n" + HelpStyle.Render("↑/↓ naviga · digita per filtrare · enter seleziona · esc annulla"))
+	sb.WriteString("\n" + HelpStyle.Render(help))
 	w := m.width
 	if w == 0 {
 		w = 80
@@ -242,7 +268,16 @@ func RunList(title string, values []string) (string, bool) {
 
 // RunListItems shows a list with optional descriptions. Returns (selected Item.Value, cancelled).
 func RunListItems(title string, items []Item) (string, bool) {
-	m := listModel{title: title, items: items}
+	return runList(listModel{title: title, items: items})
+}
+
+// RunListItemsQuiet is RunListItems for a choice that whatever prints next
+// restates: the echo of the answer would say the same thing twice.
+func RunListItemsQuiet(title string, items []Item) (string, bool) {
+	return runList(listModel{title: title, items: items, quiet: true})
+}
+
+func runList(m listModel) (string, bool) {
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {

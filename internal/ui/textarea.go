@@ -65,7 +65,7 @@ func (m textAreaModel) View() tea.View {
 	sb.WriteString("\n")
 	sb.WriteString(TitleStyle.Render("  "+m.title) + "\n\n")
 	sb.WriteString(m.textarea.View() + "\n")
-	sb.WriteString(HelpStyle.Render("  ctrl+s conferma · esc annulla"))
+	sb.WriteString(HelpStyle.Render("ctrl+s conferma · esc annulla"))
 
 	w := m.width
 	if w == 0 {

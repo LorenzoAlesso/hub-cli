@@ -94,7 +94,9 @@ func TestLongListIsWindowed(t *testing.T) {
 
 	rows := 0
 	for _, line := range strings.Split(m.View().Content, "\n") {
-		if trimmed := strings.TrimSpace(stripANSI(line)); strings.HasPrefix(trimmed, "│") {
+		trimmed := strings.TrimSpace(stripANSI(line))
+		// Only rows carrying an entry: the frame pads itself top and bottom.
+		if strings.HasPrefix(trimmed, "│") && strings.Trim(trimmed, "│ ") != "" {
 			rows++
 		}
 	}
@@ -149,8 +151,10 @@ func TestListBoxBorderIsSquare(t *testing.T) {
 		}
 	}
 
-	if len(boxWidths) != len(items)+2 {
-		t.Fatalf("righe del box = %d, attese %d", len(boxWidths), len(items)+2)
+	// The entries, the two border lines, and the blank row the frame keeps above
+	// and below them.
+	if want := len(items) + 4; len(boxWidths) != want {
+		t.Fatalf("righe del box = %d, attese %d", len(boxWidths), want)
 	}
 	for i, w := range boxWidths {
 		if w != boxWidths[0] {

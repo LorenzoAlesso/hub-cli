@@ -70,19 +70,13 @@ func (m spinnerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m spinnerModel) View() tea.View {
 	elapsed := formatElapsed(time.Since(m.start))
 
+	// A finished step lands on the same grid as the log inside the workflows:
+	// this spinner runs before the TUI, and its lines stay above it on screen.
 	if m.done {
 		if m.err != nil {
-			return tea.NewView(fmt.Sprintf("  %s  %s  %s\n",
-				ErrStyle.Render("✗"),
-				ValueStyle.Render(m.label),
-				DimStyle.Render(elapsed),
-			))
+			return tea.NewView(logFail(m.label, "", elapsed) + "\n")
 		}
-		return tea.NewView(fmt.Sprintf("  %s  %s  %s\n",
-			SuccessStyle.Render("✓"),
-			ValueStyle.Render(m.label),
-			DimStyle.Render(elapsed),
-		))
+		return tea.NewView(logDone(m.label, "", elapsed) + "\n")
 	}
 
 	w := m.width
@@ -107,7 +101,9 @@ func formatElapsed(d time.Duration) string {
 	}
 	m := int(d.Minutes())
 	s := int(d.Seconds()) % 60
-	return fmt.Sprintf("%dm %ds", m, s)
+	// Zero-padded: without it "1m 4s" and "2m 43s" never line up in the column
+	// the durations are read down.
+	return fmt.Sprintf("%dm %02ds", m, s)
 }
 
 // RunSpinner runs fn while showing an animated spinner with elapsed timer.

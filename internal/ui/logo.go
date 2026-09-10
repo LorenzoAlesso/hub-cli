@@ -12,7 +12,11 @@ import (
 const (
 	logoCharDelay = 6 * time.Millisecond
 	logoEndDelay  = 450 * time.Millisecond
-	logoSubtitle  = "\n\n  local deploy automation"
+
+	// The subtitle says what hub-cli does, not where: it deploys to the local
+	// cluster and to PSN, so naming only the first dated the opening screen.
+	logoTagline = "build · push · deploy"
+	logoTargets = "locale · psn"
 )
 
 type logoCharMsg struct{}
@@ -36,13 +40,30 @@ func newLogoModel() logoModel {
 		lines[i] = strings.TrimRight(l, " ")
 	}
 	ascii := []rune(strings.Join(lines, "\n"))
-	sub := []rune(logoSubtitle)
+	sub := []rune("\n\n  " + logoTagline + logoSubtitleGap(lines) + logoTargets)
 
 	return logoModel{
 		ascii: ascii,
 		sub:   sub,
 		total: len(ascii) + len(sub),
 	}
+}
+
+// logoSubtitleGap right-aligns the targets under the last column of the
+// lettering, so the subtitle reads as the base of the logo instead of a line
+// that happens to follow it.
+func logoSubtitleGap(lines []string) string {
+	width := 0
+	for _, l := range lines {
+		if n := len([]rune(l)); n > width {
+			width = n
+		}
+	}
+	gap := width - 2 - len([]rune(logoTagline)) - len([]rune(logoTargets))
+	if gap < 2 {
+		gap = 2
+	}
+	return strings.Repeat(" ", gap)
 }
 
 func (m logoModel) Init() tea.Cmd {
