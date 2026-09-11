@@ -38,6 +38,7 @@ const (
 	wfSvcBuildArg
 	wfSvcBuilding
 	wfSvcPushing
+	wfSvcPushError
 	wfSvcHelm
 	wfSvcHelmError
 	wfSvcRollback
@@ -121,6 +122,7 @@ type WorkflowModel struct {
 	buildArgQueue  []logic.DockerArg
 	buildArgIdx    int
 	svcStart       time.Time
+	pushAttempt    int // attempt of the push in flight, counted from 1
 	helmSetArg     string
 	valuesPath     string
 	chartVersion   string
@@ -355,8 +357,8 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcHelmError,
-		wfSvcRestartConfirm:
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcPushError,
+		wfSvcHelmError, wfSvcRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit && m.state == wfSvcDockerBranchSelect {
@@ -382,6 +384,8 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishDockerBranchSwitchSelect()
 			case wfSvcRestartConfirm:
 				return m.finishRestartPrompt()
+			case wfSvcPushError:
+				return m.finishPushError()
 			}
 			return m.finishHelmError()
 		}
@@ -421,9 +425,14 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case wfSvcPushing:
-			m.log = append(m.log, logFailure("Push", msg.err, elapsed)...)
-			m.log = appendOutput(m.log, msg.output)
-			return m, tea.Quit
+			// A refused or dropped push usually goes through a moment later, so
+			// it is repeated before anything is asked.
+			if m.pushAttempt < pushAttempts {
+				m.log = append(m.log, logPushRetry(m.pushAttempt, msg.err, msg.output, elapsed)...)
+				return m.enterPushAttempt(m.pushAttempt + 1)
+			}
+			m.log = append(m.log, logPushFailure(m.pushAttempt, msg.err, msg.output, elapsed)...)
+			return m.enterPushError()
 		case wfSvcHelm:
 			m.log = append(m.log, logFailure("helm upgrade", msg.err, elapsed)...)
 			m.log = appendOutput(m.log, msg.output)
@@ -457,7 +466,7 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 		return m.enterPush()
 
 	case wfSvcPushing:
-		m.log = append(m.log, logDone("Push", "", elapsed))
+		m.log = append(m.log, logDone("Push", pushNote(m.pushAttempt), elapsed))
 		return m.enterHelm()
 
 	case wfSvcHelm:
@@ -1208,21 +1217,71 @@ func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 // ── Push ──────────────────────────────────────────────────────────────────────
 
 func (m WorkflowModel) enterPush() (tea.Model, tea.Cmd) {
+	return m.enterPushAttempt(1)
+}
+
+// enterPushAttempt runs one attempt of the push. A repeated one waits first, so
+// the registry is not asked again straight after refusing.
+func (m WorkflowModel) enterPushAttempt(attempt int) (tea.Model, tea.Cmd) {
 	m.state = wfSvcPushing
+	m.pushAttempt = attempt
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Docker Push")
+	m.spinner = newSpinnerModel(pushLabel("Docker Push", attempt))
 	svc := m.svc
 	newTag := m.newTag
 	testUI := m.testUI
+	refuse := testUI && refusesSimulatedPush(attempt, m.svcIdx, len(m.selectedServices))
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if attempt > 1 {
+			time.Sleep(pushRetryDelay)
+		}
 		if testUI {
 			time.Sleep(1500 * time.Millisecond)
+			if refuse {
+				return wfOpDoneMsg{err: errSimulatedPush, output: []byte(simulatedECRTimeout)}
+			}
 			return wfOpDoneMsg{}
 		}
 		var buf bytes.Buffer
 		err := logic.DockerPush(svc.ECRRepository, newTag, &buf)
 		return wfOpDoneMsg{err: err, output: buf.Bytes()}
 	})
+}
+
+// ── Push error recovery ───────────────────────────────────────────────────────
+
+// enterPushError asks what to do once every attempt of the push has failed.
+// The services before this one are already on the cluster: skipping this one
+// carries the run on to the next service and to the sync, where leaving would
+// skip the sync as well.
+func (m WorkflowModel) enterPushError() (tea.Model, tea.Cmd) {
+	cancel := "esce senza deploy"
+	if len(m.deployed) > 0 {
+		cancel = "esce subito, senza il sync dei servizi già deployati"
+	}
+	othersLeft := len(m.deployed) > 0 || m.svcIdx+1 < len(m.selectedServices)
+
+	m.state = wfSvcPushError
+	m.list = listModel{
+		errorTone: true,
+		title:     "Push di " + m.svcName + " non riuscito",
+		items:     pushErrorItems(m.svcName, m.oldTag, othersLeft, cancel),
+		width:     m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishPushError() (tea.Model, tea.Cmd) {
+	switch m.list.selected {
+	case "retry":
+		return m.enterPush()
+	case "skip":
+		m.log = append(m.log, logPushSkipped(m.svcName, m.oldTag)...)
+		m.svcIdx++
+		return m.startNextService()
+	}
+	m.cancelled = true
+	return m, tea.Quit
 }
 
 // ── Helm ──────────────────────────────────────────────────────────────────────
@@ -1444,8 +1503,8 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString("\n" + m.multisel.View().Content)
 	case wfSvcTagSync:
 		sb.WriteString("\n" + m.confirm.View().Content)
-	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcHelmError,
-		wfSvcRestartConfirm:
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcPushError,
+		wfSvcHelmError, wfSvcRestartConfirm:
 		sb.WriteString("\n" + m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
 		sb.WriteString("\n" + m.input.View().Content)
@@ -1554,10 +1613,15 @@ func (m WorkflowModel) renderPipelineStages() string {
 		deploy = trackSpinning
 	}
 
+	push := async(wfSvcPushing, wfSvcHelm)
+	if m.state == wfSvcPushError {
+		push = trackFailed
+	}
+
 	return stageRow(m.svcName, []string{
 		trackerTab(config, "Config", frame),
 		trackerTab(async(wfSvcBuilding, wfSvcPushing), "Build", frame),
-		trackerTab(async(wfSvcPushing, wfSvcHelm), "Push", frame),
+		trackerTab(push, "Push", frame),
 		trackerTab(deploy, "Deploy", frame),
 	})
 }

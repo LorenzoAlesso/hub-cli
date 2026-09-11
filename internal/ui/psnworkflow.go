@@ -30,6 +30,7 @@ const (
 	psnBuildArg
 	psnBuilding
 	psnPushing
+	psnPushError
 	psnHelmDeploy
 	psnDeployError
 	psnRestartConfirm
@@ -117,6 +118,7 @@ type PSNWorkflowModel struct {
 	buildArgIdx    int
 	depStart       time.Time
 	svcLogStart    int // where the header of the service in hand sits in the log
+	pushAttempt    int // attempt of the push in flight, counted from 1
 
 	// deployed collects what has been built and pushed, for the single helm
 	// upgrade at the end and for the sync that writes the tags back.
@@ -291,7 +293,7 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError, psnRestartConfirm:
+	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -308,6 +310,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishDockerfileMissing()
 			case psnRestartConfirm:
 				return m.finishRestartPrompt()
+			case psnPushError:
+				return m.finishPushError()
 			default:
 				return m.finishDeployError()
 			}
@@ -844,21 +848,71 @@ func (m PSNWorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 // ── Push ──────────────────────────────────────────────────────────────────────
 
 func (m PSNWorkflowModel) enterPush() (tea.Model, tea.Cmd) {
+	return m.enterPushAttempt(1)
+}
+
+// enterPushAttempt runs one attempt of the push. A repeated one waits first, so
+// the registry is not asked again straight after refusing.
+func (m PSNWorkflowModel) enterPushAttempt(attempt int) (tea.Model, tea.Cmd) {
 	m.state = psnPushing
+	m.pushAttempt = attempt
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Docker Push (ACR)")
+	m.spinner = newSpinnerModel(pushLabel("Docker Push (ACR)", attempt))
 	repo := m.repo
 	newTag := m.newTag
 	testUI := m.testUI
+	refuse := testUI && refusesSimulatedPush(attempt, m.depIdx, len(m.selectedDeps))
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if attempt > 1 {
+			time.Sleep(pushRetryDelay)
+		}
 		if testUI {
 			time.Sleep(1500 * time.Millisecond)
+			if refuse {
+				return psnOpDoneMsg{err: errSimulatedPush, output: []byte(simulatedACRRefusal)}
+			}
 			return psnOpDoneMsg{}
 		}
 		var buf bytes.Buffer
 		err := logic.DockerPush(repo, newTag, &buf)
 		return psnOpDoneMsg{err: err, output: buf.Bytes()}
 	})
+}
+
+// ── Push error recovery ───────────────────────────────────────────────────────
+
+// enterPushError asks what to do once every attempt of the push has failed.
+// The release is upgraded once for all the services, at the end: ending the run
+// here would leave the images already pushed undeployed, so skipping this one
+// is what lets the others reach the cluster.
+func (m PSNWorkflowModel) enterPushError() (tea.Model, tea.Cmd) {
+	cancel := "il release resta invariato"
+	if len(m.deployed) > 0 {
+		cancel += ", le immagini già pushate restano su ACR"
+	}
+	othersLeft := len(m.deployed) > 0 || m.depIdx+1 < len(m.selectedDeps)
+
+	m.state = psnPushError
+	m.list = listModel{
+		errorTone: true,
+		title:     "Push di " + m.svc.Name + " non riuscito",
+		items:     pushErrorItems(m.svc.Name, m.oldTag, othersLeft, cancel),
+		width:     m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m PSNWorkflowModel) finishPushError() (tea.Model, tea.Cmd) {
+	switch m.list.selected {
+	case "retry":
+		return m.enterPush()
+	case "skip":
+		m.log = append(m.log, logPushSkipped(m.svc.Name, m.oldTag)...)
+		m.depIdx++
+		return m.startNextDeployment()
+	}
+	m.cancelled = true
+	return m, tea.Quit
 }
 
 // ── Deploy: helm upgrade ──────────────────────────────────────────────────────
@@ -1126,9 +1180,14 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case psnPushing:
-			m.log = append(m.log, logFailure("Push", msg.err, elapsed)...)
-			m.log = appendOutput(m.log, msg.output)
-			return m, tea.Quit
+			// A refused or dropped push usually goes through a moment later, so
+			// it is repeated before anything is asked.
+			if m.pushAttempt < pushAttempts {
+				m.log = append(m.log, logPushRetry(m.pushAttempt, msg.err, msg.output, elapsed)...)
+				return m.enterPushAttempt(m.pushAttempt + 1)
+			}
+			m.log = append(m.log, logPushFailure(m.pushAttempt, msg.err, msg.output, elapsed)...)
+			return m.enterPushError()
 		case psnHelmDeploy:
 			m.log = append(m.log, logFailure("helm upgrade", msg.err, elapsed)...)
 			m.log = appendOutput(m.log, msg.output)
@@ -1150,7 +1209,7 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 		return m.enterPush()
 
 	case psnPushing:
-		m.log = append(m.log, logDone("Push", "", elapsed))
+		m.log = append(m.log, logDone("Push", pushNote(m.pushAttempt), elapsed))
 		m.deployed = append(m.deployed, psnDeployed{
 			svc: m.svc, oldTag: m.oldTag, newTag: m.newTag, elapsed: time.Since(m.depStart)})
 		m.depIdx++
@@ -1190,7 +1249,7 @@ func (m PSNWorkflowModel) View() tea.View {
 		sb.WriteString(logRunning(m.spinner.spinner.View(), m.spinner.label,
 			formatElapsed(time.Since(m.opStart))) + "\n")
 	// A question stands off the log it interrupts, instead of continuing it.
-	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnDeployError, psnRestartConfirm:
+	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sb.WriteString("\n" + m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString("\n" + m.multisel.View().Content)
@@ -1304,9 +1363,14 @@ func (m PSNWorkflowModel) renderPipelineStages() string {
 		return trackPending
 	}
 
+	push := async(psnPushing, psnHelmDeploy)
+	if m.state == psnPushError {
+		push = trackFailed
+	}
+
 	return stageRow(m.svc.Name, []string{
 		trackerTab(config, "Config", frame),
 		trackerTab(async(psnBuilding, psnPushing), "Build", frame),
-		trackerTab(async(psnPushing, psnHelmDeploy), "Push", frame),
+		trackerTab(push, "Push", frame),
 	})
 }

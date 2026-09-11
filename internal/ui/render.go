@@ -59,6 +59,10 @@ func logFail(label, note, value string) string {
 	return logStep("✗", ErrStyle, label, note, value)
 }
 
+func logWarnStep(label, note, value string) string {
+	return logStep("⚠", WarnStyle, label, note, value)
+}
+
 // logRunning is the step in flight. The glyph is the spinner frame, already
 // styled by the spinner itself, so it goes through untouched: a running step
 // keeps the same columns as the finished ones above it, instead of being a

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"Hub-cli/internal/logic"
 )
 
 // TestPreviewRun is not an assertion but a viewer: `go test -run Preview -v`
@@ -52,6 +54,17 @@ func TestPreviewRun(t *testing.T) {
 	fmt.Println(logDone("Build", "", "2m 43s"))
 	fmt.Println(logDone("Push", "", "1m 04s"))
 
+	// The last service, its push refused once and taken on the second attempt.
+	fmt.Println(logServiceHeader(3, 3, "webapp", "3.0.9-dev", "3.0.10-dev"))
+	fmt.Println(logInfo("Immagine", "exampleacr.azurecr.io/apps/webapp:3.0.9-dev"))
+	fmt.Println(logInfo("Dockerfile", "~/.hub-cli/repos/acme-docker/webapp/Dockerfile"))
+	fmt.Println()
+	fmt.Println(logDone("Build", "", "2m 11s"))
+	for _, l := range logPushRetry(1, errSimulatedPush, []byte(simulatedACRRefusal), "3.2s") {
+		fmt.Println(l)
+	}
+	fmt.Println(logDone("Push", pushNote(2), "1m 09s"))
+
 	fmt.Println(logSection("Rilascio", "app-site-a-coll"))
 	fmt.Println(logDone("helm upgrade", "3 servizi · 1 revisione", "7.4s"))
 	fmt.Println(logStep("↻", CursorStyle, "Riavvio jboss-be", "tag invariato", "18.4s"))
@@ -75,6 +88,25 @@ func TestPreviewRun(t *testing.T) {
 			{Label: "Riprova", Desc: "riesegue helm upgrade"},
 			{Label: "Annulla", Desc: "il release resta invariato, le immagini restano su ACR"},
 		}, 0, 0, 100)))
+
+	// A push that failed every attempt, and the question asked instead of quitting.
+	fmt.Println()
+	for _, l := range logPushRetry(2, errSimulatedPush, []byte(simulatedACRRefusal), "6.4s") {
+		fmt.Println(l)
+	}
+	for _, l := range logPushFailure(pushAttempts, errSimulatedPush,
+		[]byte("The push refers to repository [exampleacr.azurecr.io/apps/webapp]\n"+simulatedACRRefusal), "6.1s") {
+		fmt.Println(l)
+	}
+	pushErr, _ := PSNWorkflowModel{
+		svc:          logic.HelmService{Name: "webapp"},
+		oldTag:       "3.0.9-dev",
+		selectedDeps: []string{"jboss-be", "jboss-fe", "webapp"},
+		depIdx:       2,
+		deployed:     make([]psnDeployed, 2),
+		width:        100,
+	}.enterPushError()
+	fmt.Println(pushErr.(PSNWorkflowModel).list.View().Content)
 
 	SetSummaryContext("Cluster A — Collaudo  ·  app-coll",
 		"3 servizi  ·  1 revisione helm  ·  values su dev-site-a")
