@@ -1496,8 +1496,12 @@ func (m WorkflowModel) View() tea.View {
 	switch m.state {
 	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting, wfSvcDockerBranchSwitch,
 		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
-		sb.WriteString(logRunning(m.spinnerFrame(), m.spinner.label,
-			formatElapsed(time.Since(m.opStart))) + "\n")
+		// A run stopped mid-step quits in that step's state: the final frame
+		// must not show it as still running under the error that ended it.
+		if !m.cancelled {
+			sb.WriteString(logRunning(m.spinnerFrame(), m.spinner.label,
+				formatElapsed(time.Since(m.opStart))) + "\n")
+		}
 	// A question stands off the log it interrupts, instead of continuing it.
 	case wfServiceSelect:
 		sb.WriteString("\n" + m.multisel.View().Content)

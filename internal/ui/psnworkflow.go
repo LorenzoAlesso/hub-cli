@@ -1246,8 +1246,12 @@ func (m PSNWorkflowModel) View() tea.View {
 	}
 	switch m.state {
 	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
-		sb.WriteString(logRunning(m.spinner.spinner.View(), m.spinner.label,
-			formatElapsed(time.Since(m.opStart))) + "\n")
+		// A run stopped mid-step quits in that step's state: the final frame
+		// must not show it as still running under the error that ended it.
+		if !m.cancelled {
+			sb.WriteString(logRunning(m.spinner.spinner.View(), m.spinner.label,
+				formatElapsed(time.Since(m.opStart))) + "\n")
+		}
 	// A question stands off the log it interrupts, instead of continuing it.
 	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sb.WriteString("\n" + m.list.View().Content)
