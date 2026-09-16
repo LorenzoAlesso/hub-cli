@@ -59,6 +59,20 @@ func RenderGradientSeparator(width int) string {
 	return sb.String()
 }
 
+// RenderGradientRule is RenderGradientSeparator standing up: a column of │
+// shading the same way, top to bottom, to divide two blocks side by side.
+func RenderGradientRule(height int) string {
+	if height <= 0 {
+		return ""
+	}
+	colors := lipgloss.Blend1D(height, Accent, Secondary)
+	lines := make([]string, len(colors))
+	for i, c := range colors {
+		lines[i] = lipgloss.NewStyle().Foreground(c).Render("│")
+	}
+	return strings.Join(lines, "\n")
+}
+
 // PrintRunHeader states where a run is going, once, before anything runs. These
 // facts hold for the whole run, so they head it instead of scrolling past mixed
 // with the steps — and printing them before the first step means the long Azure
