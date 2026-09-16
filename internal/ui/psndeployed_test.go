@@ -2,6 +2,8 @@ package ui
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -79,23 +81,129 @@ func TestReleaseReadStartsFromTheDeployedTags(t *testing.T) {
 	}
 }
 
-// A release never installed, or one that cannot be read, does not stop the run:
-// it starts from the values and the log says which case it is.
-func TestReleaseReadWithoutDeployedTags(t *testing.T) {
-	cases := map[string]error{
-		"non ancora installato":       logic.ErrReleaseNotFound,
-		"tag deployati non leggibili": errors.New("helm get values fallito: timeout"),
+// A release never installed is not a failure: the run starts from the values.
+func TestReleaseReadNotInstalled(t *testing.T) {
+	m := readRelease(t, driftedModel(), psnReleaseReadMsg{err: logic.ErrReleaseNotFound})
+	if m.state != psnDepSelect || len(m.drift) != 0 {
+		t.Errorf("stato %v, scostamenti %d", m.state, len(m.drift))
 	}
-	for want, err := range cases {
-		m := readRelease(t, driftedModel(), psnReleaseReadMsg{err: err})
-		if m.state != psnDepSelect || len(m.drift) != 0 {
-			t.Errorf("%s: stato %v, scostamenti %d", want, m.state, len(m.drift))
+	if got := m.svcByName["app-esb"].Tag; got != "3.0.9-dev" {
+		t.Errorf("app-esb parte da %q, atteso il tag del values", got)
+	}
+	if log := stripANSI(strings.Join(m.log, "\n")); !strings.Contains(log, "non ancora installato") {
+		t.Errorf("il log non lo dice:\n%s", log)
+	}
+}
+
+var errUnreachable = errors.New(`helm get values fallito: Error: kubernetes cluster unreachable: ` +
+	`Get "https://aks-a.privatelink.example.com:443/version": dial tcp: lookup aks-a.privatelink.example.com: no such host`)
+
+// The first failed read is repeated on its own, with the reason cut down to
+// what explains it.
+func TestReleaseReadRetriesOnce(t *testing.T) {
+	m := driftedModel()
+	m.releaseAttempt = 1
+	m = readRelease(t, m, psnReleaseReadMsg{err: errUnreachable})
+
+	if m.state != psnReleaseRead || m.releaseAttempt != 2 {
+		t.Fatalf("stato %v, tentativo %d: atteso il secondo tentativo", m.state, m.releaseAttempt)
+	}
+	if !strings.Contains(m.spinner.label, "tentativo 2/2") {
+		t.Errorf("etichetta dello spinner = %q", m.spinner.label)
+	}
+	log := stripANSI(strings.Join(m.log, "\n"))
+	for _, want := range []string{
+		"tentativo 1/2 non riuscito",
+		"cluster non raggiungibile: lookup aks-a.privatelink.example.com: no such host",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("il log non riporta %q:\n%s", want, log)
 		}
-		if got := m.svcByName["app-esb"].Tag; got != "3.0.9-dev" {
-			t.Errorf("%s: app-esb parte da %q, atteso il tag del values", want, got)
-		}
-		if log := stripANSI(strings.Join(m.log, "\n")); !strings.Contains(log, want) {
-			t.Errorf("il log non dice %q:\n%s", want, log)
+	}
+	if strings.Contains(log, "helm get values fallito") {
+		t.Errorf("la catena di Helm non va mostrata per un cluster irraggiungibile:\n%s", log)
+	}
+}
+
+// Past the last attempt the run stops and asks, retry first.
+func TestReleaseReadAsksAfterTheLastAttempt(t *testing.T) {
+	m := driftedModel()
+	m.releaseAttempt = releaseReadAttempts
+	m = readRelease(t, m, psnReleaseReadMsg{err: errUnreachable})
+
+	if m.state != psnReleaseError {
+		t.Fatalf("stato = %v, atteso psnReleaseError", m.state)
+	}
+	if m.list.title != "Il cluster non risponde" || !m.list.errorTone {
+		t.Errorf("domanda: titolo %q, tono d'errore %v", m.list.title, m.list.errorTone)
+	}
+	if m.list.items[m.list.cursor].Value != "retry" {
+		t.Error("la scelta preselezionata deve essere Riprova")
+	}
+	log := stripANSI(strings.Join(m.log, "\n"))
+	if !strings.Contains(log, "✗  Release sul cluster      cluster non raggiungibile") ||
+		!strings.Contains(log, "     lookup aks-a.privatelink.example.com: no such host") {
+		t.Errorf("riga di errore:\n%s", log)
+	}
+	if !strings.Contains(m.renderTracker(), "✗ Chart") {
+		t.Errorf("la fase Chart va segnata come fallita:\n%s", stripANSI(m.renderTracker()))
+	}
+
+	retry := m
+	retry.list.selected = "retry"
+	next, _ := retry.finishReleaseError()
+	if got := next.(PSNWorkflowModel); got.state != psnReleaseRead || got.releaseAttempt != 1 {
+		t.Errorf("Riprova: stato %v, tentativo %d", got.state, got.releaseAttempt)
+	}
+
+	proceed := m
+	proceed.list.selected = "continue"
+	next, _ = proceed.finishReleaseError()
+	got := next.(PSNWorkflowModel)
+	if got.state != psnDepSelect || got.svcByName["app-esb"].Tag != "3.0.9-dev" {
+		t.Errorf("Prosegui: stato %v, app-esb %q", got.state, got.svcByName["app-esb"].Tag)
+	}
+	if log := stripANSI(strings.Join(got.log, "\n")); !strings.Contains(log, "senza confronto con il cluster") {
+		t.Errorf("Prosegui va dichiarato:\n%s", log)
+	}
+
+	cancel := m
+	cancel.list.selected = "cancel"
+	next, _ = cancel.finishReleaseError()
+	if !next.(PSNWorkflowModel).cancelled {
+		t.Error("Annulla deve chiudere il run")
+	}
+}
+
+// Any other failure asks the same, but says what it was in full: there is no
+// telling which part of it matters.
+func TestReleaseReadOtherErrors(t *testing.T) {
+	err := errors.New(`helm get values fallito: Error: query: failed to query with labels: secrets is forbidden`)
+	m := driftedModel()
+	m.releaseAttempt = releaseReadAttempts
+	m = readRelease(t, m, psnReleaseReadMsg{err: err})
+
+	if m.state != psnReleaseError || m.list.title != "Release non leggibile" {
+		t.Fatalf("stato %v, titolo %q", m.state, m.list.title)
+	}
+	if strings.Contains(m.list.items[0].Desc, "VPN") {
+		t.Errorf("il suggerimento sulla VPN vale solo per un cluster irraggiungibile: %q", m.list.items[0].Desc)
+	}
+	log := stripANSI(strings.Join(m.log, "\n"))
+	if !strings.Contains(log, "tag deployati non leggibili") || !strings.Contains(log, err.Error()) {
+		t.Errorf("riga di errore:\n%s", log)
+	}
+}
+
+func TestReleaseReadDetail(t *testing.T) {
+	cases := map[string]string{
+		`Error: Kubernetes cluster unreachable: Get "https://10.0.0.4:443/version": dial tcp 10.0.0.4:443: i/o timeout`: "dial tcp 10.0.0.4:443: i/o timeout",
+		errUnreachable.Error(): "lookup aks-a.privatelink.example.com: no such host",
+		`Error: kubernetes cluster unreachable: the server has asked for the client to provide credentials`: "the server has asked for the client to provide credentials",
+	}
+	for msg, want := range cases {
+		if got := releaseReadDetail(errors.New(msg)); got != want {
+			t.Errorf("releaseReadDetail(%q) = %q, atteso %q", msg, got, want)
 		}
 	}
 }
@@ -129,101 +237,218 @@ func TestUpgradeKeepsWhatTheValuesMissed(t *testing.T) {
 	}
 }
 
-func startService(t *testing.T, m PSNWorkflowModel, name string) PSNWorkflowModel {
+// tagFormFor takes a model from the ACR read into the tag form.
+func tagFormFor(t *testing.T, m PSNWorkflowModel, acr map[string][]string, names ...string) PSNWorkflowModel {
 	t.Helper()
-	m.selectedDeps = []string{name}
-	next, _ := m.startNextDeployment()
+	m.selectedDeps = names
+	next, _ := m.handleTagsLoaded(psnTagsLoadedMsg{tags: acr})
+	m = next.(PSNWorkflowModel)
+	if m.state != psnTagForm {
+		t.Fatalf("stato = %v, atteso psnTagForm", m.state)
+	}
+	return m
+}
+
+func confirmTags(t *testing.T, m PSNWorkflowModel, tags map[int]string) PSNWorkflowModel {
+	t.Helper()
+	for row, tag := range tags {
+		m.tagForm.rows[row].input.SetValue(tag)
+	}
+	next, _ := m.finishTagForm()
 	return next.(PSNWorkflowModel)
 }
 
-// The proposal skips a tag ACR already holds, and says why it jumps.
-func TestProposalStepsPastACR(t *testing.T) {
+func plainLog(lines []string) string {
+	return stripANSI(strings.Join(lines, "\n"))
+}
+
+// Every selected service is asked in one frame, each proposal stepping past
+// what ACR holds, and nothing is logged until the tags are confirmed.
+func TestTagFormAsksEveryServiceAtOnce(t *testing.T) {
 	m := readRelease(t, driftedModel(), psnReleaseReadMsg{deployed: deployedTags(map[string]string{
 		"appEsb": "3.0.11-dev",
 	})})
-	m.acrTags = map[string][]string{"acr.azurecr.io/demo/app-esb": {"3.0.10-dev", "3.0.11-dev", "3.0.12-dev"}}
+	before := len(m.log)
+	m = tagFormFor(t, m, map[string][]string{
+		"acr.azurecr.io/demo/app-esb": {"3.0.10-dev", "3.0.11-dev", "3.0.12-dev"},
+	}, "app-be", "app-esb")
 
-	m = startService(t, m, "app-esb")
-	if m.suggestedTag != "3.0.13-dev" {
-		t.Errorf("proposto %q, atteso 3.0.13-dev", m.suggestedTag)
+	rows := m.tagForm.rows
+	if len(rows) != 2 {
+		t.Fatalf("righe = %d, attese 2", len(rows))
 	}
-	if got := m.input.textInput.Value(); got != "3.0.13-dev" {
-		t.Errorf("valore nel campo = %q", got)
+	if rows[0].current != "3.0.11-dev" || rows[0].suggested != "3.0.12-dev" || rows[0].skipped != "" {
+		t.Errorf("app-be: %+v", rows[0])
 	}
-	log := stripANSI(strings.Join(m.log, "\n"))
-	if !strings.Contains(log, "Su ACR     tag immagine 3.0.12-dev già presente") {
-		t.Errorf("il salto della proposta non è spiegato:\n%s", log)
+	if rows[1].current != "3.0.11-dev" || rows[1].suggested != "3.0.13-dev" || rows[1].skipped != "3.0.12-dev" {
+		t.Errorf("app-esb: parte dal tag deployato e salta quello su ACR: %+v", rows[1])
+	}
+	if len(m.log) != before {
+		t.Errorf("prima della conferma non va scritto nulla:\n%s", plainLog(m.log[before:]))
 	}
 
-	// Nothing on ACR past the running tag: a plain increment, and no note.
-	m = readRelease(t, driftedModel(), psnReleaseReadMsg{})
-	m.acrTags = map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev"}}
-	m = startService(t, m, "app-be")
-	if m.suggestedTag != "3.0.12-dev" || strings.Contains(stripANSI(strings.Join(m.log, "\n")), "Su ACR") {
-		t.Errorf("proposta %q, log:\n%s", m.suggestedTag, stripANSI(strings.Join(m.log, "\n")))
+	view := stripANSI(m.View().Content)
+	for _, want := range []string{"Tag immagine  2 servizi", "su ACR: tag immagine 3.0.12-dev già presente", "▸ Servizi", "· Pipeline"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("la vista non mostra %q:\n%s", want, view)
+		}
 	}
 }
 
-// A chosen tag that exists on ACR is asked about; changing it goes back to the
-// question with the header pending again, overwriting goes on and says so.
-func TestExistingTagIsAskedAbout(t *testing.T) {
-	m := readRelease(t, driftedModel(), psnReleaseReadMsg{})
-	m.acrTags = map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev", "3.0.12-dev"}}
-	m = startService(t, m, "app-be")
+// Confirmed with nothing to ask, the builds start straight away: each header is
+// complete from the start, and the notes about a tag sit under its service.
+func TestConfirmedTagsStartTheBuilds(t *testing.T) {
+	m := tagFormFor(t, readRelease(t, driftedModel(), psnReleaseReadMsg{}), nil, "app-be", "app-fe")
+	before := len(m.log)
+	m = confirmTags(t, m, map[int]string{1: "3.0.11-dev"})
 
-	m.input.textInput.SetValue("3.0.12-dev")
-	next, _ := m.finishTagInput()
+	if m.state != psnBuilding || m.depIdx != 0 {
+		t.Fatalf("stato %v, servizio %d: attesa la build del primo", m.state, m.depIdx)
+	}
+	section := plainLog(m.log[before:])
+	if !strings.Contains(section, "1/2  app-be") || !strings.Contains(section, "3.0.11-dev → 3.0.12-dev") {
+		t.Errorf("testata del primo servizio:\n%s", section)
+	}
+	if strings.Contains(section, "→ …") || strings.Contains(section, "app-fe") {
+		t.Errorf("solo il primo servizio, con la testata completa:\n%s", section)
+	}
+	if !strings.Contains(section, "Dockerfile (simulato)") {
+		t.Errorf("le righe del Dockerfile stanno nella sezione del servizio:\n%s", section)
+	}
+	if !strings.Contains(stripANSI(m.renderTracker()), "APP-BE      ⣾") && !strings.Contains(stripANSI(m.renderTracker()), "Build") {
+		t.Errorf("riga del servizio:\n%s", stripANSI(m.renderTracker()))
+	}
+	if strings.Contains(stripANSI(m.renderTracker()), "Config") {
+		t.Errorf("la fase Config non c'è più:\n%s", stripANSI(m.renderTracker()))
+	}
+
+	// The second service opens when the first is pushed, still without asking.
+	m.depIdx = 1
+	at := len(m.log)
+	next, _ := m.startNextDeployment()
 	m = next.(PSNWorkflowModel)
-	if m.state != psnTagExists {
-		t.Fatalf("stato = %v, atteso psnTagExists", m.state)
+	section = plainLog(m.log[at:])
+	if m.state != psnBuilding || !strings.Contains(section, "2/2  app-fe") ||
+		!strings.Contains(section, "invariato") || !strings.Contains(section, "Il manifest non cambia") {
+		t.Errorf("secondo servizio, stato %v:\n%s", m.state, section)
+	}
+}
+
+// Tags already on ACR are asked about together. Changing goes back to the form
+// on the first of them, with what was typed; overwriting marks them all.
+func TestTakenTagsAreAskedTogether(t *testing.T) {
+	acr := map[string][]string{
+		"acr.azurecr.io/demo/app-be": {"3.0.11-dev", "3.0.12-dev", "3.0.13-dev"},
+		"acr.azurecr.io/demo/app-fe": {"3.0.11-dev", "3.0.12-dev"},
+	}
+	m := tagFormFor(t, readRelease(t, driftedModel(), psnReleaseReadMsg{}), acr, "app-be", "app-esb", "app-fe")
+	m = confirmTags(t, m, map[int]string{0: "3.0.12-dev", 2: "3.0.12-dev"})
+
+	if m.state != psnTagExists || !slices.Equal(m.taken, []int{0, 2}) {
+		t.Fatalf("stato %v, in conflitto %v", m.state, m.taken)
+	}
+	view := stripANSI(m.View().Content)
+	for _, want := range []string{"Tag già presenti su ACR", "app-be   3.0.12-dev", "app-fe   3.0.12-dev", "le immagini esistenti"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("la domanda non mostra %q:\n%s", want, view)
+		}
 	}
 	if m.list.items[m.list.cursor].Value != "change" {
-		t.Error("la scelta preselezionata deve essere cambiare tag, non sovrascrivere")
-	}
-	if header := stripANSI(m.log[m.svcLogStart]); !strings.Contains(header, "3.0.11-dev → …") {
-		t.Errorf("finché la domanda è aperta la testata resta in sospeso: %q", header)
+		t.Error("la scelta preselezionata deve essere cambiare tag")
 	}
 
-	m.list.selected = "change"
-	next, _ = m.finishTagExists()
-	changed := next.(PSNWorkflowModel)
-	if changed.state != psnTagInput || changed.input.textInput.Value() != "3.0.13-dev" {
-		t.Errorf("cambia tag: stato %v, campo %q", changed.state, changed.input.textInput.Value())
+	change := m
+	change.list.selected = "change"
+	next, _ := change.finishTagExists()
+	back := next.(PSNWorkflowModel)
+	if back.state != psnTagForm || back.tagForm.cursor != 0 || back.tagForm.done {
+		t.Errorf("Cambia tag: stato %v, cursore %d, done %v", back.state, back.tagForm.cursor, back.tagForm.done)
 	}
-	if !strings.Contains(stripANSI(changed.log[changed.svcLogStart]), "→ …") {
-		t.Errorf("la testata deve tornare in sospeso: %q", stripANSI(changed.log[changed.svcLogStart]))
+	if got := back.tagForm.values(); got[0] != "3.0.12-dev" || got[2] != "3.0.12-dev" {
+		t.Errorf("i tag digitati vanno conservati: %v", got)
 	}
 
-	m.list.selected = "overwrite"
-	next, _ = m.finishTagExists()
-	kept := next.(PSNWorkflowModel)
-	if kept.newTag != "3.0.12-dev" || kept.state == psnTagExists || kept.state == psnTagInput {
-		t.Errorf("sovrascrivi: tag %q, stato %v", kept.newTag, kept.state)
+	over := m
+	over.list.selected = "overwrite"
+	before := len(over.log)
+	next, _ = over.finishTagExists()
+	over = next.(PSNWorkflowModel)
+	if over.state != psnBuilding {
+		t.Fatalf("Sovrascrivi: stato %v", over.state)
 	}
-	if log := stripANSI(strings.Join(kept.log, "\n")); !strings.Contains(log, "Il push sostituisce 3.0.12-dev su ACR.") {
-		t.Errorf("la sovrascrittura non è dichiarata:\n%s", log)
+	if !over.plan[0].overwrite || over.plan[1].overwrite || !over.plan[2].overwrite {
+		t.Errorf("sovrascritture = %v %v %v", over.plan[0].overwrite, over.plan[1].overwrite, over.plan[2].overwrite)
 	}
-	if header := stripANSI(kept.log[kept.svcLogStart]); !strings.Contains(header, "3.0.11-dev → 3.0.12-dev") {
-		t.Errorf("confermato il tag, la testata va completata: %q", header)
+	if section := plainLog(over.log[before:]); !strings.Contains(section, "Il push sostituisce 3.0.12-dev su ACR.") {
+		t.Errorf("la sovrascrittura va dichiarata sotto il servizio:\n%s", section)
 	}
 }
 
 // The running tag is on ACR by definition: redeploying it is the unchanged-tag
-// path, not a collision, and tags that could not be read are not checked.
+// path, not a collision; tags that could not be read are not checked.
 func TestRunningTagAndUnreadTagsAreNotAsked(t *testing.T) {
-	m := readRelease(t, driftedModel(), psnReleaseReadMsg{})
-	m.acrTags = map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev"}}
-	m = startService(t, m, "app-be")
-	m.input.textInput.SetValue("3.0.11-dev")
-	if next, _ := m.finishTagInput(); next.(PSNWorkflowModel).state == psnTagExists {
+	m := tagFormFor(t, readRelease(t, driftedModel(), psnReleaseReadMsg{}),
+		map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev"}}, "app-be")
+	if got := confirmTags(t, m, map[int]string{0: "3.0.11-dev"}); got.state == psnTagExists {
 		t.Error("il tag in esecuzione non deve chiedere conferma di sovrascrittura")
 	}
 
-	m = readRelease(t, driftedModel(), psnReleaseReadMsg{})
-	m = startService(t, m, "app-be")
-	m.input.textInput.SetValue("3.0.1-dev")
-	if next, _ := m.finishTagInput(); next.(PSNWorkflowModel).state == psnTagExists {
+	m = tagFormFor(t, readRelease(t, driftedModel(), psnReleaseReadMsg{}), nil, "app-be")
+	if got := confirmTags(t, m, map[int]string{0: "3.0.1-dev"}); got.state == psnTagExists {
 		t.Error("senza tag letti da ACR non c'è niente da confrontare")
+	}
+}
+
+// A Dockerfile question is asked before any build, under the section of its
+// service; once answered the section leaves the log, and comes back when the
+// builds reach that service.
+func TestDockerfileQuestionsComeBeforeTheBuilds(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"app-be", "other"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := readRelease(t, driftedModel(), psnReleaseReadMsg{})
+	m.testUI = false
+	m.project = &config.PSNProjectConfig{Namespace: "*", DockerRoot: root}
+	m = tagFormFor(t, m, nil, "app-be", "app-fe")
+	before := len(m.log)
+	m = confirmTags(t, m, nil)
+
+	// app-be has <name>/Dockerfile; app-fe has none, and the scan is a question.
+	if m.state != psnDockerfileList || m.prepIdx != 1 {
+		t.Fatalf("stato %v, servizio in preparazione %d", m.state, m.prepIdx)
+	}
+	asking := plainLog(m.log[before:])
+	if !strings.Contains(asking, "2/2  app-fe") || !strings.Contains(asking, "Scansione") || strings.Contains(asking, "app-be") {
+		t.Errorf("durante la domanda si vede solo la sezione di app-fe:\n%s", asking)
+	}
+	if m.plan[0].dockerfile != filepath.Join(root, "app-be", "Dockerfile") ||
+		!strings.Contains(plainLog(m.plan[0].lines), "Dockerfile") {
+		t.Errorf("app-be già risolto: %q %q", m.plan[0].dockerfile, m.plan[0].lines)
+	}
+	if strings.Contains(stripANSI(m.renderTracker()), "Pipeline [") {
+		t.Errorf("la pipeline non è ancora partita:\n%s", stripANSI(m.renderTracker()))
+	}
+
+	chosen := filepath.Join(root, "other", "Dockerfile")
+	m.list.selected = chosen
+	next, _ := m.finishDockerfile()
+	m = next.(PSNWorkflowModel)
+	if m.state != psnBuilding || m.depIdx != 0 {
+		t.Fatalf("dopo la risposta: stato %v, servizio %d", m.state, m.depIdx)
+	}
+	building := plainLog(m.log[before:])
+	if !strings.HasPrefix(strings.TrimLeft(building, "\n"), "──  1/2  app-be") || strings.Contains(building, "app-fe") {
+		t.Errorf("la build parte dal primo servizio, la sezione di app-fe aspetta il suo turno:\n%s", building)
+	}
+	if m.plan[1].dockerfile != chosen || !strings.Contains(plainLog(m.plan[1].lines), "Scansione") {
+		t.Errorf("app-fe: %q %q", m.plan[1].dockerfile, m.plan[1].lines)
 	}
 }
 
@@ -237,10 +462,10 @@ func TestTagsLoadedWithErrors(t *testing.T) {
 	})
 	m = next.(PSNWorkflowModel)
 
-	if m.state != psnTagInput {
-		t.Fatalf("stato = %v, atteso psnTagInput", m.state)
+	if m.state != psnTagForm {
+		t.Fatalf("stato = %v, atteso psnTagForm", m.state)
 	}
-	log := stripANSI(strings.Join(m.log, "\n"))
+	log := plainLog(m.log)
 	if !strings.Contains(log, "non verificabili") || !strings.Contains(log, "app-fe: az: timeout") {
 		t.Errorf("il log non riporta l'errore di app-fe:\n%s", log)
 	}
@@ -249,20 +474,13 @@ func TestTagsLoadedWithErrors(t *testing.T) {
 	}
 }
 
-// A read that went through has nothing to report: the log goes straight to the
-// first service.
+// A read that went through has nothing to report.
 func TestTagsLoadedQuietly(t *testing.T) {
 	m := readRelease(t, driftedModel(), psnReleaseReadMsg{})
-	m.selectedDeps = []string{"app-be"}
 	before := len(m.log)
-	next, _ := m.handleTagsLoaded(psnTagsLoadedMsg{
-		tags: map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev"}},
-	})
-	m = next.(PSNWorkflowModel)
-
-	if m.svcLogStart != before {
-		t.Errorf("prima della testata sono state aggiunte righe:\n%s",
-			stripANSI(strings.Join(m.log[before:m.svcLogStart], "\n")))
+	m = tagFormFor(t, m, map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev"}}, "app-be")
+	if len(m.log) != before {
+		t.Errorf("righe aggiunte:\n%s", plainLog(m.log[before:]))
 	}
 }
 
@@ -312,10 +530,13 @@ func TestTestUIShowsAlignmentAndACRSkip(t *testing.T) {
 	next, _ = m.handleTagsLoaded(psnTagsLoadedMsg{tags: psnFakeACRTags(repos)})
 	m = next.(PSNWorkflowModel)
 
-	if m.svc.Name != "webapp" || m.suggestedTag != "1.0.2" {
-		t.Errorf("webapp: proposto %q, atteso 1.0.2 (1.0.1 è già su ACR)", m.suggestedTag)
+	if m.state != psnTagForm || m.tagForm.rows[0].name != "webapp" {
+		t.Fatalf("stato %v: atteso il riquadro dei tag", m.state)
 	}
-	if !strings.Contains(stripANSI(strings.Join(m.log, "\n")), "tag immagine 1.0.1 già presente") {
-		t.Errorf("il salto della proposta non si vede:\n%s", stripANSI(strings.Join(m.log, "\n")))
+	if r := m.tagForm.rows[0]; r.suggested != "1.0.2" || r.skipped != "1.0.1" {
+		t.Errorf("webapp: proposto %q (saltato %q), atteso 1.0.2 perché 1.0.1 è già su ACR", r.suggested, r.skipped)
+	}
+	if view := stripANSI(m.View().Content); !strings.Contains(view, "su ACR: tag immagine 1.0.1 già presente") {
+		t.Errorf("il salto della proposta non si vede:\n%s", view)
 	}
 }

@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -51,6 +52,10 @@ type listModel struct {
 	// quiet drops the echo of the answer, for a choice that whatever prints next
 	// restates in full.
 	quiet bool
+
+	// note is what the question is about, shown in the frame above the choices
+	// when it does not fit in the title.
+	note []string
 }
 
 // borderStyle is the colour of the frame, which says who is asking.
@@ -237,6 +242,9 @@ func (m listModel) View() tea.View {
 	}
 	if below > 0 {
 		lines = append(lines, DimStyle.Render(fmt.Sprintf("  ↓ altre %d", below)))
+	}
+	if len(m.note) > 0 {
+		lines = append(append(slices.Clone(m.note), ""), lines...)
 	}
 
 	sb.WriteString(questionBox(title, m.borderStyle(), lines))

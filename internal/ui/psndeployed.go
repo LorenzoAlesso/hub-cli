@@ -1,9 +1,12 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 
 	"Hub-cli/internal/logic"
 
@@ -17,6 +20,94 @@ import (
 
 // psnReleaseLabel names the step that reads the deployed release.
 const psnReleaseLabel = "Release sul cluster"
+
+// A failed read of the release almost always means the cluster cannot be
+// reached — a VPN or DNS hiccup on a private cluster — and then the upgrade at
+// the end would fail the same way, after minutes of builds. The read is tried
+// again once on its own; past that, the run asks instead of going on blind.
+const (
+	releaseReadAttempts   = 2
+	releaseReadRetryDelay = 3 * time.Second
+)
+
+// releaseReadNote names a failed read in the note column.
+func releaseReadNote(err error) string {
+	if clusterUnreachable(err) {
+		return "cluster non raggiungibile"
+	}
+	return "tag deployati non leggibili"
+}
+
+// releaseReadDetail keeps what explains an unreachable cluster — the lookup or
+// the dial that failed — out of the chain Helm wraps it in. Any other error is
+// shown whole: there is no telling which part matters.
+func releaseReadDetail(err error) string {
+	msg := err.Error()
+	if !clusterUnreachable(err) {
+		return msg
+	}
+	rest := msg
+	// Helm versions differ on the capital.
+	for _, marker := range []string{"Kubernetes cluster unreachable: ", "kubernetes cluster unreachable: "} {
+		if _, after, ok := strings.Cut(msg, marker); ok {
+			rest = after
+			break
+		}
+	}
+	if idx := strings.Index(rest, "dial tcp"); idx != -1 {
+		rest = strings.TrimPrefix(rest[idx:], "dial tcp: ")
+	}
+	return strings.TrimSpace(rest)
+}
+
+// logReleaseRetry is a read that failed and is about to be repeated.
+func logReleaseRetry(attempt int, err error, elapsed string) []string {
+	detail := releaseReadDetail(err)
+	if clusterUnreachable(err) {
+		detail = releaseReadNote(err) + ": " + detail
+	}
+	return []string{
+		logWarnStep(psnReleaseLabel, fmt.Sprintf("tentativo %d/%d non riuscito", attempt, releaseReadAttempts), elapsed),
+		logDetail(detail),
+	}
+}
+
+// logReleaseFailure is the last attempt failed, with the reason underneath.
+func logReleaseFailure(err error, elapsed string) []string {
+	return []string{logFail(psnReleaseLabel, releaseReadNote(err), elapsed), logDetail(releaseReadDetail(err))}
+}
+
+// releaseErrorTitle and releaseErrorItems are the question asked once every
+// attempt has failed. Retrying comes first: a reconnected VPN is the usual fix.
+func releaseErrorTitle(err error) string {
+	if clusterUnreachable(err) {
+		return "Il cluster non risponde"
+	}
+	return "Release non leggibile"
+}
+
+func releaseErrorItems(err error) []Item {
+	retry := "rilegge il release"
+	if clusterUnreachable(err) {
+		retry += " (VPN o DNS ripristinati)"
+	}
+	return []Item{
+		{Value: "retry", Label: "Riprova", Desc: retry},
+		{Value: "continue", Label: "Prosegui", Desc: "parte dai tag del values: l'upgrade finale potrebbe fallire"},
+		{Value: "cancel", Label: "Annulla", Desc: "esce prima di buildare"},
+	}
+}
+
+func clusterUnreachable(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "cluster unreachable")
+}
+
+// In --test-ui the first read of the release fails the way a private cluster
+// does when the VPN drops for a moment, and the second one goes through: the
+// retry would otherwise be a path no simulated run ever shows. The host is
+// under a reserved domain.
+var errSimulatedUnreachable = errors.New(`helm get values fallito: Error: Kubernetes cluster unreachable: ` +
+	`Get "https://aks-demo.privatelink.example.com:443/version": dial tcp: lookup aks-demo.privatelink.example.com: no such host`)
 
 // logDrift reports the images whose values tag is not the one the release runs,
 // one line each. What the run does about it is not explained here: it shows
@@ -113,10 +204,24 @@ func fetchACRTags(repos []string) psnTagsLoadedMsg {
 	return msg
 }
 
-// logACRNote explains a proposal that skips ahead: ACR already holds an image
-// newer than the one running. The proposal itself is in the tag field.
-func logACRNote(highest string) string {
-	return logInfo("Su ACR", "tag immagine "+highest+" già presente")
+// takenTagLines lists, in the question about them, the tags already on ACR.
+func takenTagLines(names, tags []string) []string {
+	width := 0
+	for _, n := range names {
+		width = max(width, lipgloss.Width(n))
+	}
+	lines := make([]string, len(names))
+	for i, n := range names {
+		lines[i] = ValueStyle.Render(n) + pad(lipgloss.Width(n), width+3) + WarnStyle.Render(tags[i])
+	}
+	return lines
+}
+
+func overwriteDesc(count int) string {
+	if count == 1 {
+		return "il push sostituisce l'immagine esistente"
+	}
+	return "il push sostituisce le immagini esistenti"
 }
 
 // In --test-ui the release runs jboss-fe one tag ahead of the values, the way a

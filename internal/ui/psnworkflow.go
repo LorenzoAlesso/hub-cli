@@ -22,11 +22,12 @@ type psnState int
 const (
 	psnChartsPrep psnState = iota
 	psnReleaseRead
+	psnReleaseError
 	psnRepoPrep
 	psnBranchSelect
 	psnDepSelect
 	psnTagsLoading
-	psnTagInput
+	psnTagForm
 	psnTagExists
 	psnDockerfileList
 	psnDockerfileMissing
@@ -120,6 +121,8 @@ type PSNWorkflowModel struct {
 	// repository missing from it could not be read, and its tag is not checked.
 	acrTags map[string][]string
 
+	releaseAttempt int // attempt of the release read in flight, counted from 1
+
 	namespace     string
 	project       *config.PSNProjectConfig // per-namespace Dockerfile resolution override
 	projectDir    string                   // managed clone of the project repo, "" = working copy
@@ -130,11 +133,19 @@ type PSNWorkflowModel struct {
 	selectedDeps  []string
 	depIdx        int
 
+	// plan is what every selected service needs, gathered before the first
+	// build; the Dockerfile questions of service prepIdx are asked with its
+	// section standing in the log from prepLogStart.
+	plan         []psnPlanned
+	tagForm      tagFormModel
+	taken        []int // plan entries whose tag is already on ACR
+	prepIdx      int
+	prepLogStart int
+
 	svc            logic.HelmService
 	repo           string // registry + path, no tag
 	oldTag         string
 	newTag         string
-	suggestedTag   string
 	dockerfilePath string
 	buildArgs      map[string]string
 	buildArgQueue  []logic.DockerArg
@@ -329,7 +340,7 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnBranchSelect, psnTagExists, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
+	case psnReleaseError, psnBranchSelect, psnTagExists, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -340,6 +351,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			case psnBranchSelect:
 				return m.finishProjectBranchSelect()
+			case psnReleaseError:
+				return m.finishReleaseError()
 			case psnTagExists:
 				return m.finishTagExists()
 			case psnDockerfileList:
@@ -368,7 +381,19 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case psnTagInput, psnBuildArg:
+	case psnTagForm:
+		sm, cmd := m.tagForm.Update(msg)
+		m.tagForm = sm.(tagFormModel)
+		if m.tagForm.quit {
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		if m.tagForm.done {
+			return m.finishTagForm()
+		}
+		return m, cmd
+
+	case psnBuildArg:
 		sm, cmd := m.input.Update(msg)
 		m.input = sm.(inputModel)
 		if m.input.quit {
@@ -376,9 +401,6 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if m.input.done {
-			if m.state == psnTagInput {
-				return m.finishTagInput()
-			}
 			return m.finishBuildArg()
 		}
 		return m, cmd
@@ -484,14 +506,31 @@ func (m PSNWorkflowModel) enterReleaseRead() (tea.Model, tea.Cmd) {
 			logic.HelmGetValuesCommandLine(m.release.Name, m.namespace)+"  (confronto con il values)"))
 		return m.afterReleaseRead()
 	}
+	return m.enterReleaseReadAttempt(1)
+}
 
+// enterReleaseReadAttempt runs one attempt of the read. A repeated one waits
+// first, so a connection that has just dropped has a moment to come back.
+func (m PSNWorkflowModel) enterReleaseReadAttempt(attempt int) (tea.Model, tea.Cmd) {
 	m.state = psnReleaseRead
+	m.releaseAttempt = attempt
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Lettura del release " + m.release.Name)
+	label := "Lettura del release " + m.release.Name
+	if attempt > 1 {
+		label += fmt.Sprintf(" · tentativo %d/%d", attempt, releaseReadAttempts)
+	}
+	m.spinner = newSpinnerModel(label)
+
 	release, namespace, testUI := m.release.Name, m.namespace, m.testUI
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if attempt > 1 {
+			time.Sleep(releaseReadRetryDelay)
+		}
 		if testUI {
 			time.Sleep(800 * time.Millisecond)
+			if attempt == 1 {
+				return psnReleaseReadMsg{err: errSimulatedUnreachable}
+			}
 			return psnReleaseReadMsg{deployed: psnFakeDeployed()}
 		}
 		deployed, err := logic.ReleaseValues(release, namespace)
@@ -505,13 +544,12 @@ func (m PSNWorkflowModel) handleReleaseRead(msg psnReleaseReadMsg) (tea.Model, t
 	switch {
 	case errors.Is(msg.err, logic.ErrReleaseNotFound):
 		m.log = append(m.log, logDone(psnReleaseLabel, "non ancora installato", elapsed))
+	case msg.err != nil && m.releaseAttempt < releaseReadAttempts:
+		m.log = append(m.log, logReleaseRetry(m.releaseAttempt, msg.err, elapsed)...)
+		return m.enterReleaseReadAttempt(m.releaseAttempt + 1)
 	case msg.err != nil:
-		// Not a reason to stop: the values are still a sound starting point,
-		// only no longer a verified one — and the log says so.
-		m.log = append(m.log,
-			logWarnStep(psnReleaseLabel, "tag deployati non leggibili", elapsed),
-			logDetail(msg.err.Error()),
-			logDetail("Si parte dai tag del values: verificarli prima di confermare."))
+		m.log = append(m.log, logReleaseFailure(msg.err, elapsed)...)
+		return m.enterReleaseError(msg.err)
 	default:
 		m.drift = m.values.AlignToDeployed(msg.deployed)
 		if len(m.drift) == 0 {
@@ -521,6 +559,32 @@ func (m PSNWorkflowModel) handleReleaseRead(msg psnReleaseReadMsg) (tea.Model, t
 		}
 	}
 	return m.afterReleaseRead()
+}
+
+// enterReleaseError asks what to do once every read has failed. Going on is
+// allowed — the images can still be built and pushed — but it is a choice, not
+// something the run does on its own.
+func (m PSNWorkflowModel) enterReleaseError(err error) (tea.Model, tea.Cmd) {
+	m.state = psnReleaseError
+	m.list = listModel{
+		errorTone: true,
+		title:     releaseErrorTitle(err),
+		items:     releaseErrorItems(err),
+		width:     m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m PSNWorkflowModel) finishReleaseError() (tea.Model, tea.Cmd) {
+	switch m.list.selected {
+	case "retry":
+		return m.enterReleaseReadAttempt(1)
+	case "continue":
+		m.log = append(m.log, logWarn("Si parte dai tag del values, senza confronto con il cluster.")...)
+		return m.afterReleaseRead()
+	}
+	m.cancelled = true
+	return m, tea.Quit
 }
 
 func (m PSNWorkflowModel) afterReleaseRead() (tea.Model, tea.Cmd) {
@@ -711,7 +775,7 @@ func (m PSNWorkflowModel) enterTagsLoading() (tea.Model, tea.Cmd) {
 		for _, repo := range repos {
 			m.log = append(m.log, wfDryRunLine(logic.ACRTagsCommandLine(repo)))
 		}
-		return m.startNextDeployment()
+		return m.enterTagForm()
 	}
 
 	m.state = psnTagsLoading
@@ -731,139 +795,195 @@ func (m PSNWorkflowModel) enterTagsLoading() (tea.Model, tea.Cmd) {
 // nothing to report until a service needs it, and then it is said there.
 func (m PSNWorkflowModel) handleTagsLoaded(msg psnTagsLoadedMsg) (tea.Model, tea.Cmd) {
 	m.acrTags = msg.tags
-	if len(msg.errs) == 0 {
-		return m.startNextDeployment()
-	}
-
-	// Unreadable tags do not stop the run: the check is a safeguard, and the
-	// push itself does not depend on it.
-	m.log = append(m.log, logWarnStep("Tag su ACR", "non verificabili", formatElapsed(time.Since(m.opStart))))
-	for _, name := range m.selectedDeps {
-		if err, ok := msg.errs[m.svcByName[name].Repository]; ok {
-			m.log = append(m.log, logDetail(name+": "+err.Error()))
+	if len(msg.errs) > 0 {
+		// Unreadable tags do not stop the run: the check is a safeguard, and the
+		// push itself does not depend on it.
+		m.log = append(m.log, logWarnStep("Tag su ACR", "non verificabili", formatElapsed(time.Since(m.opStart))))
+		for _, name := range m.selectedDeps {
+			if err, ok := msg.errs[m.svcByName[name].Repository]; ok {
+				m.log = append(m.log, logDetail(name+": "+err.Error()))
+			}
 		}
 	}
-	return m.startNextDeployment()
+	return m.enterTagForm()
 }
 
-// ── Per-service pipeline ──────────────────────────────────────────────────────
+// ── Plan: every question before the first build ───────────────────────────────
 
-// startNextDeployment builds and pushes one image at a time; the release is
-// upgraded once, at the end, with every new tag in the same revision.
-func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
-	if m.depIdx >= len(m.selectedDeps) {
-		return m.enterHelmDeploy()
-	}
-
-	name := m.selectedDeps[m.depIdx]
-	m.svc = m.svcByName[name]
-	m.repo = m.svc.Repository
-	m.oldTag = m.svc.Tag
-	m.newTag = ""
-	m.dockerfilePath = ""
-	m.buildArgs = make(map[string]string)
-	m.buildArgQueue = nil
-	m.buildArgIdx = 0
-	m.depStart = time.Now()
-
-	SetStatus(name, m.cluster.Name)
-
-	// The service opens with its header straight away, the tag half pending
-	// until chosen: the question about the tag is then asked under the section
-	// it belongs to, not above it.
-	m.svcLogStart = len(m.log)
-	m.log = append(m.log, m.serviceHeader())
-
-	// The proposal steps past what ACR already holds; when that is more than a
-	// plain increment, the jump is explained before it is offered.
-	existing := m.acrTags[m.repo]
-	suggested, err := logic.NextTag(m.oldTag, existing)
-	if err != nil {
-		suggested = m.oldTag
-	}
-	m.suggestedTag = suggested
-	if plain, err := logic.IncrementPatch(m.oldTag); err == nil && plain != suggested {
-		m.log = append(m.log, logACRNote(logic.HighestInSeries(m.oldTag, existing)))
-	}
-	return m.enterTagInput()
+// psnPlanned is one selected service with everything its pipeline needs. It is
+// all gathered before the first build — tag, Dockerfile, build args — so the
+// builds run one after the other without stopping for a question.
+type psnPlanned struct {
+	svc        logic.HelmService
+	newTag     string
+	overwrite  bool // the tag is already on ACR, and replacing it was confirmed
+	dockerfile string
+	buildArgs  map[string]string
+	lines      []string // what resolving the Dockerfile logged, for the service section
 }
 
-// ── Tag input ─────────────────────────────────────────────────────────────────
-
-func (m PSNWorkflowModel) enterTagInput() (tea.Model, tea.Cmd) {
-	m.state = psnTagInput
-	m.input = newInputModel("Tag immagine", m.suggestedTag, m.suggestedTag)
-	m.input.width = m.width
-	return m, m.input.Init()
-}
-
-// serviceHeader renders the header of the service in hand. Its tag half stays
-// pending until the tag is chosen.
-func (m PSNWorkflowModel) serviceHeader() string {
-	return logServiceHeader(m.depIdx+1, len(m.selectedDeps), m.svc.Name, m.oldTag, m.newTag)
-}
-
-func (m PSNWorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
-	val := m.input.textInput.Value()
-	if val == "" {
-		val = m.suggestedTag
+// enterTagForm asks the tags of all the selected services in one frame. Each
+// proposal steps past what ACR already holds.
+func (m PSNWorkflowModel) enterTagForm() (tea.Model, tea.Cmd) {
+	m.plan = make([]psnPlanned, len(m.selectedDeps))
+	rows := make([]tagFormRow, len(m.selectedDeps))
+	for i, name := range m.selectedDeps {
+		svc := m.svcByName[name]
+		existing := m.acrTags[svc.Repository]
+		suggested, err := logic.NextTag(svc.Tag, existing)
+		if err != nil {
+			suggested = svc.Tag
+		}
+		skipped := ""
+		if plain, err := logic.IncrementPatch(svc.Tag); err == nil && plain != suggested {
+			skipped = logic.HighestInSeries(svc.Tag, existing)
+		}
+		m.plan[i] = psnPlanned{svc: svc}
+		rows[i] = newTagFormRow(name, svc.Tag, suggested, skipped)
 	}
-	m.newTag = val
 
-	// A tag already on ACR, other than the one running, names an image the push
-	// would replace — one built for something else, or not deployed yet. The
-	// header stays pending while that is asked: the tag is not chosen yet.
-	if m.newTag != m.oldTag && slices.Contains(m.acrTags[m.repo], m.newTag) {
-		return m.enterTagExists()
-	}
-	return m.acceptTag()
+	m.state = psnTagForm
+	m.tagForm = newTagForm(rows, m.width)
+	return m, m.tagForm.Init()
 }
 
-func (m PSNWorkflowModel) enterTagExists() (tea.Model, tea.Cmd) {
+// finishTagForm takes the tags. One already on ACR, other than the one running,
+// names an image the push would replace — built for something else, or not
+// deployed yet — so those are asked about, all together.
+func (m PSNWorkflowModel) finishTagForm() (tea.Model, tea.Cmd) {
+	var taken []int
+	for i, tag := range m.tagForm.values() {
+		p := &m.plan[i]
+		p.newTag, p.overwrite = tag, false
+		if tag != p.svc.Tag && slices.Contains(m.acrTags[p.svc.Repository], tag) {
+			taken = append(taken, i)
+		}
+	}
+	if len(taken) > 0 {
+		return m.enterTagExists(taken)
+	}
+	return m.enterPrep(0)
+}
+
+func (m PSNWorkflowModel) enterTagExists(taken []int) (tea.Model, tea.Cmd) {
+	var names, tags []string
+	for _, i := range taken {
+		names = append(names, m.plan[i].svc.Name)
+		tags = append(tags, m.plan[i].newTag)
+	}
+
+	m.taken = taken
 	m.state = psnTagExists
 	m.list = listModel{
-		// The service is named by the section the question sits in.
-		title: m.newTag + " esiste già su ACR",
+		title: "Tag già presenti su ACR",
+		note:  takenTagLines(names, tags),
 		items: []Item{
-			{Value: "change", Label: "Cambia tag", Desc: "propone " + m.suggestedTag},
-			{Value: "overwrite", Label: "Sovrascrivi", Desc: "il push sostituisce l'immagine esistente"},
+			{Value: "change", Label: "Cambia tag", Desc: "torna ai tag"},
+			{Value: "overwrite", Label: "Sovrascrivi", Desc: overwriteDesc(len(taken))},
 		},
 		width: m.width,
 	}
 	return m, m.list.Init()
 }
 
+// finishTagExists goes back to the tags with the cursor on the first one taken,
+// or goes on replacing every image listed.
 func (m PSNWorkflowModel) finishTagExists() (tea.Model, tea.Cmd) {
 	if m.list.selected != "overwrite" {
-		m.newTag = ""
-		return m.enterTagInput()
+		m.state = psnTagForm
+		m.tagForm.done = false
+		return m, m.tagForm.focus(m.taken[0])
 	}
-	m.log = append(m.log, logWarn("Il push sostituisce "+m.newTag+" su ACR.")...)
-	return m.acceptTag()
+	for _, i := range m.taken {
+		m.plan[i].overwrite = true
+	}
+	return m.enterPrep(0)
 }
 
-// acceptTag goes on with the tag chosen for the service in hand, completing its
-// header where it stands.
-func (m PSNWorkflowModel) acceptTag() (tea.Model, tea.Cmd) {
-	m.log[m.svcLogStart] = m.serviceHeader()
+// ── Plan: Dockerfile and build args ───────────────────────────────────────────
 
+// enterPrep resolves the Dockerfile and the build args of service i. Most of
+// the time nothing needs asking and it goes straight to the next service; when
+// something does, the service section stands while the question is asked, and
+// moves to its place in the run once the builds reach it.
+func (m PSNWorkflowModel) enterPrep(i int) (tea.Model, tea.Cmd) {
+	if i >= len(m.plan) {
+		m.depIdx = 0
+		return m.startNextDeployment()
+	}
+
+	p := m.plan[i]
+	m.prepIdx = i
+	m.svc, m.repo, m.oldTag, m.newTag = p.svc, p.svc.Repository, p.svc.Tag, p.newTag
+	m.dockerfilePath = ""
+	m.buildArgs = make(map[string]string)
+	m.buildArgQueue, m.buildArgIdx = nil, 0
+
+	m.prepLogStart = len(m.log)
+	m.log = append(m.log, logServiceHeader(i+1, len(m.plan), p.svc.Name, p.svc.Tag, p.newTag))
+	return m.resolveDockerfile()
+}
+
+// dockerfileReady files what was resolved for the service in hand, takes its
+// lines out of the log until its build starts, and moves on.
+func (m PSNWorkflowModel) dockerfileReady() (tea.Model, tea.Cmd) {
+	p := &m.plan[m.prepIdx]
+	p.dockerfile = m.dockerfilePath
+	p.buildArgs = m.buildArgs
+	p.lines = slices.Clone(m.log[m.prepLogStart+1:])
+	m.log = m.log[:m.prepLogStart]
+	return m.enterPrep(m.prepIdx + 1)
+}
+
+// ── Per-service pipeline ──────────────────────────────────────────────────────
+
+// startNextDeployment builds and pushes one image at a time, with nothing left
+// to ask; the release is upgraded once, at the end, with every new tag in the
+// same revision.
+func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
+	if m.depIdx >= len(m.plan) {
+		return m.enterHelmDeploy()
+	}
+
+	p := m.plan[m.depIdx]
+	m.svc, m.repo, m.oldTag, m.newTag = p.svc, p.svc.Repository, p.svc.Tag, p.newTag
+	m.dockerfilePath, m.buildArgs = p.dockerfile, p.buildArgs
+	m.depStart = time.Now()
+	SetStatus(p.svc.Name, m.cluster.Name)
+
+	m.svcLogStart = len(m.log)
+	m.log = append(m.log, m.serviceHeader())
+	m.log = append(m.log, serviceNotes(p)...)
+	m.log = append(m.log, p.lines...)
+	return m.enterBuild()
+}
+
+// serviceHeader renders the header of the service in hand.
+func (m PSNWorkflowModel) serviceHeader() string {
+	return logServiceHeader(m.depIdx+1, len(m.plan), m.svc.Name, m.oldTag, m.newTag)
+}
+
+// serviceNotes are the facts about a service's tag, above its Dockerfile.
+func serviceNotes(p psnPlanned) []string {
+	var lines []string
+	if p.overwrite {
+		lines = append(lines, logWarn("Il push sostituisce "+p.newTag+" su ACR.")...)
+	}
 	// Redeploying the same tag overwrites the image on ACR, but helm renders an
 	// identical manifest: Kubernetes sees no change and never recreates the pod,
 	// so the old image keeps running. imagePullPolicy: Always does not help —
 	// it governs pod creation, not whether a pod is recreated.
-	if m.newTag == m.oldTag {
-		m.log = append(m.log, logWarn(
+	if p.newTag == p.svc.Tag {
+		lines = append(lines, logWarn(
 			"Il manifest non cambia: il pod non riparte da solo.",
 			"A fine deploy hub-cli propone il riavvio.")...)
 	}
-	if !m.svc.TagsAgree() {
-		m.log = append(m.log, logWarn(
+	if !p.svc.TagsAgree() {
+		lines = append(lines, logWarn(
 			"I riferimenti alla stessa immagine hanno tag diversi.",
 			"Verranno allineati tutti al nuovo tag.")...)
 	}
-	m.log = append(m.log, logInfo("Immagine", m.repo+":"+m.oldTag))
-
-	return m.resolveDockerfile()
+	return append(lines, logInfo("Immagine", p.svc.Repository+":"+p.svc.Tag))
 }
 
 // ── Dockerfile resolve ────────────────────────────────────────────────────────
@@ -875,7 +995,7 @@ func (m PSNWorkflowModel) acceptTag() (tea.Model, tea.Cmd) {
 func (m PSNWorkflowModel) resolveDockerfile() (tea.Model, tea.Cmd) {
 	if m.testUI {
 		m.log = append(m.log, logInfo("Dockerfile", "(simulato)"))
-		return m.enterBuild()
+		return m.dockerfileReady()
 	}
 
 	if m.project != nil {
@@ -938,6 +1058,7 @@ func (m PSNWorkflowModel) enterDockerfileScan(root string) (tea.Model, tea.Cmd) 
 	files, err := logic.FindDockerfiles(root)
 	if err != nil || len(files) == 0 {
 		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", root)))
+		m.cancelled = true
 		return m, tea.Quit
 	}
 
@@ -989,14 +1110,14 @@ func (m PSNWorkflowModel) afterDockerfile() (tea.Model, tea.Cmd) {
 		m.buildArgIdx = 0
 		return m.enterBuildArg()
 	}
-	return m.enterBuild()
+	return m.dockerfileReady()
 }
 
 // ── Build args ────────────────────────────────────────────────────────────────
 
 func (m PSNWorkflowModel) enterBuildArg() (tea.Model, tea.Cmd) {
 	if m.buildArgIdx >= len(m.buildArgQueue) {
-		return m.enterBuild()
+		return m.dockerfileReady()
 	}
 	m.state = psnBuildArg
 	arg := m.buildArgQueue[m.buildArgIdx]
@@ -1475,11 +1596,13 @@ func (m PSNWorkflowModel) View() tea.View {
 				formatElapsed(time.Since(m.opStart))) + "\n")
 		}
 	// A question stands off the log it interrupts, instead of continuing it.
-	case psnBranchSelect, psnTagExists, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
+	case psnReleaseError, psnBranchSelect, psnTagExists, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sb.WriteString("\n" + m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString("\n" + m.multisel.View().Content)
-	case psnTagInput, psnBuildArg:
+	case psnTagForm:
+		sb.WriteString("\n" + m.tagForm.View().Content)
+	case psnBuildArg:
 		sb.WriteString("\n" + m.input.View().Content)
 	case psnSummary:
 		w := m.width
@@ -1497,7 +1620,9 @@ func (m PSNWorkflowModel) View() tea.View {
 
 func (m PSNWorkflowModel) renderTracker() string {
 	frame := m.spinner.spinner.View()
-	inPipeline := m.state >= psnTagInput && m.state < psnHelmDeploy
+	// Every question comes before the first build: from there to the upgrade the
+	// services only build and push.
+	inPipeline := m.state >= psnBuilding && m.state < psnHelmDeploy
 
 	// The Azure phase always completes before the TUI starts.
 	tabs := []string{trackerTab(trackDone, "Azure", frame)}
@@ -1505,16 +1630,20 @@ func (m PSNWorkflowModel) renderTracker() string {
 	// Named for what this phase does, not for what used to be chosen here: the
 	// release is picked before the TUI starts, and what is left is the chart repo
 	// being aligned, its values read and compared with the deployed release.
-	if m.state == psnChartsPrep || m.state == psnReleaseRead {
+	switch m.state {
+	case psnChartsPrep, psnReleaseRead:
 		tabs = append(tabs, trackerTab(trackSpinning, "Chart", frame))
-	} else {
+	case psnReleaseError:
+		tabs = append(tabs, trackerTab(trackFailed, "Chart", frame))
+	default:
 		tabs = append(tabs, trackerTab(trackDone, "Chart", frame))
 	}
 
 	switch {
 	case m.state < psnDepSelect:
 		tabs = append(tabs, trackerTab(trackPending, "Servizi", frame))
-	case m.state == psnDepSelect:
+	case m.state < psnBuilding && m.state != psnTagsLoading:
+		// Choosing the services, their tags, and whatever their Dockerfiles ask.
 		tabs = append(tabs, trackerTab(trackInteractive, "Servizi", frame))
 	case m.state == psnTagsLoading:
 		tabs = append(tabs, trackerTab(trackSpinning, "Servizi", frame))
@@ -1524,10 +1653,12 @@ func (m PSNWorkflowModel) renderTracker() string {
 
 	pipeline := fmt.Sprintf("Pipeline [%d/%d]", min(m.depIdx+1, len(m.selectedDeps)), len(m.selectedDeps))
 	switch {
-	case m.state < psnTagInput:
+	case m.state < psnBuilding:
 		tabs = append(tabs, trackerTab(trackPending, "Pipeline", frame))
-	case inPipeline:
+	case m.state == psnPushError:
 		tabs = append(tabs, trackerTab(trackInteractive, pipeline, frame))
+	case inPipeline:
+		tabs = append(tabs, trackerTab(trackSpinning, pipeline, frame))
 	default:
 		tabs = append(tabs, trackerTab(trackDone, pipeline, frame))
 	}
@@ -1569,17 +1700,10 @@ func (m PSNWorkflowModel) renderTracker() string {
 
 // renderPipelineStages is the row of the service being deployed. No durations
 // here: every stage logs its own two lines below, and repeating it would say
-// the same number twice.
+// the same number twice. There is no configuration stage: it was all asked
+// before the first build.
 func (m PSNWorkflowModel) renderPipelineStages() string {
 	frame := m.spinner.spinner.View()
-
-	config := trackPending
-	switch {
-	case m.state >= psnBuilding:
-		config = trackDone
-	case m.state >= psnTagInput:
-		config = trackInteractive
-	}
 
 	async := func(activeAt, doneAt psnState) trackerState {
 		switch {
@@ -1597,7 +1721,6 @@ func (m PSNWorkflowModel) renderPipelineStages() string {
 	}
 
 	return stageRow(m.svc.Name, []string{
-		trackerTab(config, "Config", frame),
 		trackerTab(async(psnBuilding, psnPushing), "Build", frame),
 		trackerTab(push, "Push", frame),
 	})

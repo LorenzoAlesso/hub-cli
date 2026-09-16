@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"Hub-cli/internal/config"
 	"Hub-cli/internal/logic"
 )
 
@@ -47,44 +48,39 @@ func TestPreviewRun(t *testing.T) {
 	}
 	fmt.Println(logDone("Progetto Docker", "origin/site-a-pre-prod", "1.3s"))
 
-	fmt.Println(logServiceHeader(1, 3, "jboss-be", "3.0.10-dev", "3.0.10-dev"))
-	for _, l := range logWarn(
-		"Il manifest non cambia: il pod non riparte da solo.",
-		"A fine deploy hub-cli propone il riavvio.") {
-		fmt.Println(l)
-	}
-	fmt.Println(logInfo("Immagine", "exampleacr.azurecr.io/apps/jboss-be:3.0.10-dev"))
-	fmt.Println(logInfo("Dockerfile", "~/.hub-cli/repos/acme-docker/jboss-be/Dockerfile"))
+	// Every tag at once, before the first build; jboss-be is redeployed as is.
+	form := newTagForm([]tagFormRow{
+		newTagFormRow("jboss-be", "3.0.10-dev", "3.0.11-dev", ""),
+		newTagFormRow("jboss-fe", "3.0.11-dev", "3.0.13-dev", "3.0.12-dev"),
+		newTagFormRow("webapp", "3.0.9-dev", "3.0.10-dev", ""),
+	}, 100)
+	form.rows[0].input.SetValue("3.0.10-dev")
 	fmt.Println()
-	fmt.Println(logDone("Build", "", "2m 43s"))
-	fmt.Println(logDone("Push", "", "1m 04s"))
+	fmt.Println(form.View().Content)
 
 	// A tag typed by hand that ACR already holds, and the question it raises.
-	fmt.Println(logServiceHeader(2, 3, "jboss-fe", "3.0.11-dev", ""))
-	fmt.Println(logACRNote("3.0.12-dev"))
 	fmt.Println()
 	exists, _ := PSNWorkflowModel{
-		svc:          logic.HelmService{Name: "jboss-fe"},
-		newTag:       "3.0.12-dev",
-		suggestedTag: "3.0.13-dev",
-		width:        100,
-	}.enterTagExists()
+		plan:  []psnPlanned{{svc: logic.HelmService{Name: "jboss-fe"}, newTag: "3.0.12-dev"}},
+		width: 100,
+	}.enterTagExists([]int{0})
 	fmt.Println(exists.(PSNWorkflowModel).list.View().Content)
 
-	// The same service once the overwrite is confirmed.
-	overwritten, _ := PSNWorkflowModel{
-		svc:          logic.HelmService{Name: "jboss-fe"},
-		log:          []string{logServiceHeader(2, 3, "jboss-fe", "3.0.11-dev", ""), logACRNote("3.0.12-dev")},
-		selectedDeps: make([]string, 3),
-		depIdx:       1,
-		repo:         "exampleacr.azurecr.io/apps/jboss-fe",
-		oldTag:       "3.0.11-dev",
-		newTag:       "3.0.12-dev",
-		testUI:       true,
-		list:         listModel{selected: "overwrite"},
-	}.finishTagExists()
-	for _, l := range overwritten.(PSNWorkflowModel).log[:4] {
-		fmt.Println(l)
+	// Then the builds, with nothing left to ask.
+	for i, p := range []psnPlanned{
+		{svc: logic.HelmService{Name: "jboss-be", Repository: "exampleacr.azurecr.io/apps/jboss-be", Tag: "3.0.10-dev"},
+			newTag: "3.0.10-dev"},
+		{svc: logic.HelmService{Name: "jboss-fe", Repository: "exampleacr.azurecr.io/apps/jboss-fe", Tag: "3.0.11-dev"},
+			newTag: "3.0.12-dev", overwrite: true},
+	} {
+		fmt.Println(logServiceHeader(i+1, 3, p.svc.Name, p.svc.Tag, p.newTag))
+		for _, l := range serviceNotes(p) {
+			fmt.Println(l)
+		}
+		fmt.Println(logInfo("Dockerfile", "~/.hub-cli/repos/acme-docker/"+p.svc.Name+"/Dockerfile"))
+		fmt.Println()
+		fmt.Println(logDone("Build", "", "2m 43s"))
+		fmt.Println(logDone("Push", "", "1m 04s"))
 	}
 
 	// The last service, its push refused once and taken on the second attempt.
@@ -143,6 +139,21 @@ func TestPreviewRun(t *testing.T) {
 		width:        100,
 	}.enterPushError()
 	fmt.Println(pushErr.(PSNWorkflowModel).list.View().Content)
+
+	// A cluster that does not answer: the read retried once, then the question.
+	fmt.Println()
+	unreachable, _ := PSNWorkflowModel{
+		release:        config.PSNReleaseConfig{Name: "app-site-a-coll"},
+		releaseAttempt: 1,
+		opStart:        time.Now(),
+		width:          100,
+	}.handleReleaseRead(psnReleaseReadMsg{err: errSimulatedUnreachable})
+	unreachable, _ = unreachable.(PSNWorkflowModel).handleReleaseRead(psnReleaseReadMsg{err: errSimulatedUnreachable})
+	for _, l := range unreachable.(PSNWorkflowModel).log {
+		fmt.Println(l)
+	}
+	fmt.Println()
+	fmt.Println(unreachable.(PSNWorkflowModel).list.View().Content)
 
 	SetSummaryContext("Cluster A — Collaudo  ·  app-coll",
 		"3 servizi  ·  1 revisione helm  ·  values su dev-site-a")

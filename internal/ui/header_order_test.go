@@ -76,9 +76,9 @@ func TestLocalServiceLinesLandUnderTheirHeader(t *testing.T) {
 	}
 }
 
-// PSN asks the tag first: with the header already standing, the question is
-// asked under the section it belongs to.
-func TestPSNHeaderStandsWhileTheTagIsAsked(t *testing.T) {
+// PSN asks every tag before the first build, so a service's section opens when
+// its build starts, with the header already complete.
+func TestPSNHeaderIsCompleteWhenTheBuildStarts(t *testing.T) {
 	m := PSNWorkflowModel{
 		testUI:       true,
 		selectedDeps: []string{"webapp"},
@@ -86,21 +86,16 @@ func TestPSNHeaderStandsWhileTheTagIsAsked(t *testing.T) {
 			"webapp": {Name: "webapp", Repository: "acr.azurecr.io/demo/webapp", Tag: "1.0.0"},
 		},
 	}
-	next, _ := m.startNextDeployment()
+	next, _ := m.enterTagForm()
 	m = next.(PSNWorkflowModel)
-
-	if m.state != psnTagInput {
-		t.Fatalf("stato = %v, atteso psnTagInput", m.state)
-	}
-	if len(m.log) == 0 || !strings.Contains(stripANSI(m.log[m.svcLogStart]), "1.0.0 → …") {
-		t.Fatalf("durante la domanda del tag la testata deve già esserci:\n%s", stripANSI(strings.Join(m.log, "\n")))
+	if m.state != psnTagForm || len(m.log) != 0 {
+		t.Fatalf("stato %v, righe %d: prima della conferma nessuna testata", m.state, len(m.log))
 	}
 
-	start := m.svcLogStart
-	next, _ = m.finishTagInput()
+	next, _ = m.finishTagForm()
 	m = next.(PSNWorkflowModel)
-	if got := stripANSI(m.log[start]); !strings.Contains(got, "1.0.0 → 1.0.1") {
-		t.Errorf("la testata non è stata completata sul posto: %q", got)
+	if got := stripANSI(m.log[m.svcLogStart]); !strings.Contains(got, "1.0.0 → 1.0.1") || strings.Contains(got, "…") {
+		t.Errorf("testata = %q, attesa completa", got)
 	}
 }
 
