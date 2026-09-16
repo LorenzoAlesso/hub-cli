@@ -25,6 +25,29 @@ func TestStepsEndOnTheSameColumn(t *testing.T) {
 	}
 }
 
+// A running step turns into a finished one in place: whatever frame the spinner
+// is on, its label and duration already sit where the ✓ line will put them.
+func TestRunningStepKeepsTheGrid(t *testing.T) {
+	done := stripANSI(logDone("Docker Push (ACR)", "", "4.9s"))
+	for range gridDot.Frames {
+		s := newSpinnerModel("Docker Push (ACR)")
+		running := stripANSI(logRunning(s.spinner.View(), s.label, "4.9s"))
+		if lipgloss.Width(running) != logWidth {
+			t.Errorf("riga in corso larga %d invece di %d: %q", lipgloss.Width(running), logWidth, running)
+		}
+		if strings.Index(running, "Docker") != strings.Index(done, "Docker") {
+			t.Errorf("etichetta spostata:\n%q\n%q", running, done)
+		}
+		s.spinner, _ = s.spinner.Update(s.spinner.Tick())
+	}
+
+	for _, f := range gridDot.Frames {
+		if lipgloss.Width(f) != 1 {
+			t.Errorf("frame %q largo %d: il glifo occupa una colonna", f, lipgloss.Width(f))
+		}
+	}
+}
+
 // A step with no duration is a step all the same: it keeps the glyph and label
 // columns, so it lines up with the ones around it.
 func TestStepWithoutValueKeepsItsColumns(t *testing.T) {

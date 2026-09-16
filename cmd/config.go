@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"Hub-cli/internal/config"
@@ -30,48 +32,132 @@ var configShowCmd = &cobra.Command{
 		reposRoot, _ := logic.ResolveReposRoot(cfg.Config.ReposRoot)
 
 		fmt.Println(ui.SectionStyle.Render("Percorsi"))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Config:         "), ui.ValueStyle.Render(config.GetFilePath()))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Seed:           "), orNA(config.SeedFilePath()))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Repo gestiti:   "), orNA(reposRoot))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Docker Root:    "), orNA(cfg.Config.DockerRootPath))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Helm Root:      "), orNA(cfg.Config.HelmRootPath))
+		printTopLine("Config:", ui.ValueStyle.Render(config.GetFilePath()))
+		printTopLine("Seed:", orNA(config.SeedFilePath()))
+		printTopLine("Repo gestiti:", orNA(reposRoot))
+		printTopLine("Docker Root:", orNA(cfg.Config.DockerRootPath))
+		printTopLine("Helm Root:", orNA(cfg.Config.HelmRootPath))
 
 		fmt.Println(ui.SectionStyle.Render("Configurazione Globale"))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("ECR Region:     "), ui.ValueStyle.Render(cfg.Config.ECRRegion))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("ECR Account:    "), ui.ValueStyle.Render(cfg.Config.ECRAccountID))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Chart Version:  "), ui.ValueStyle.Render(cfg.Config.ChartVersion))
+		printTopLine("ECR Region:", ui.ValueStyle.Render(cfg.Config.ECRRegion))
+		printTopLine("ECR Account:", ui.ValueStyle.Render(cfg.Config.ECRAccountID))
+		printTopLine("Chart Version:", ui.ValueStyle.Render(cfg.Config.ChartVersion))
 		themeVal := cfg.Config.Theme
 		if themeVal == "" {
 			themeVal = "auto"
 		}
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Tema:           "), ui.ValueStyle.Render(themeVal))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Branch chart:   "), orNA(config.GetHelmSyncBranch()))
+		printTopLine("Tema:", ui.ValueStyle.Render(themeVal))
+		// Named apart from the per-release branch of the PSN section below.
+		printTopLine("Branch chart (locale):", orNA(config.GetHelmSyncBranch()))
 
-		if len(cfg.Services) == 0 {
-			fmt.Println(ui.WarnStyle.Render("\nNessun servizio configurato."))
-			return nil
-		}
-
-		fmt.Println(ui.SectionStyle.Render("\nServizi"))
-		for name, svc := range cfg.Services {
-			fmt.Printf("\n  %s\n", ui.SelectedItemStyle.Render("["+name+"]"))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Last Tag:      "), orNA(svc.LastTag))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Dockerfile:    "), orNA(svc.DockerfileSubpath))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Helm Values:   "), orNA(svc.HelmValuesPath))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Namespace:     "), orNA(svc.Namespace))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Chart:         "), orNA(svc.ChartName))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Release:       "), orNA(svc.ReleaseName))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("ECR Repo:      "), orNA(svc.ECRRepository))
-			if svc.HelmImagePath != "" {
-				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Helm Image:    "), ui.ValueStyle.Render(svc.HelmImagePath))
-			}
-			if svc.K8sManifestPath != "" {
-				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("K8s Manifest:  "), ui.ValueStyle.Render(svc.K8sManifestPath))
-				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("K8s Image Ref: "), ui.ValueStyle.Render(svc.K8sImageRef))
-			}
-		}
+		printLocalServices(cfg.Services)
+		printPSNConfig(cfg.PSN)
 		return nil
 	},
+}
+
+// printTopLine is a line of the top-level blocks, its value in the column the
+// longest of their labels needs.
+func printTopLine(label, value string) {
+	fmt.Printf("  %s  %s\n", ui.LabelStyle.Render(fmt.Sprintf("%-22s", label)), value)
+}
+
+func printLocalServices(services map[string]config.ServiceConfig) {
+	if len(services) == 0 {
+		fmt.Println(ui.WarnStyle.Render("\nNessun servizio configurato."))
+		return
+	}
+
+	fmt.Println(ui.SectionStyle.Render("\nServizi"))
+	// Map order changes on every run: sorted, a service is where it was last time.
+	for _, name := range sortedKeys(services) {
+		svc := services[name]
+		fmt.Printf("\n  %s\n", ui.SelectedItemStyle.Render("["+name+"]"))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Last Tag:      "), orNA(svc.LastTag))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Dockerfile:    "), orNA(svc.DockerfileSubpath))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Helm Values:   "), orNA(svc.HelmValuesPath))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Namespace:     "), orNA(svc.Namespace))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Chart:         "), orNA(svc.ChartName))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Release:       "), orNA(svc.ReleaseName))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("ECR Repo:      "), orNA(svc.ECRRepository))
+		if svc.HelmImagePath != "" {
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Helm Image:    "), ui.ValueStyle.Render(svc.HelmImagePath))
+		}
+		if svc.K8sManifestPath != "" {
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("K8s Manifest:  "), ui.ValueStyle.Render(svc.K8sManifestPath))
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("K8s Image Ref: "), ui.ValueStyle.Render(svc.K8sImageRef))
+		}
+	}
+}
+
+// printPSNConfig shows the psn block the way a run reads it: per cluster, each
+// release with the branch its chart comes from and the project — with the
+// branch it builds from — that its namespace resolves to.
+func printPSNConfig(psn config.PSNConfig) {
+	fmt.Println(ui.SectionStyle.Render("PSN"))
+	if len(psn.Clusters) == 0 {
+		fmt.Println("  " + ui.DimStyle.Render("Blocco psn non configurato: hub-cli psn non è disponibile."))
+		return
+	}
+	printTopLine("Tenant:", orNA(psn.TenantID))
+
+	for _, c := range psn.Clusters {
+		fmt.Printf("\n  %s  %s\n", ui.SelectedItemStyle.Render("["+c.Name+"]"), ui.DimStyle.Render(psnEnvLabel(c)))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("AKS:           "), orNA(c.AKSName))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("ACR:           "), orNA(c.ACRName))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Resource group:"), orNA(c.ResourceGroup))
+		fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Subscription:  "), orNA(c.SubscriptionID))
+
+		if len(c.Releases) == 0 {
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Release:       "),
+				ui.WarnStyle.Render("nessuno: il cluster non si può deployare"))
+			continue
+		}
+		for _, r := range c.Releases {
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Release:       "), orNA(r.Name))
+			fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Namespace:   "), orNA(r.Namespace))
+			fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Chart:       "), orNA(r.Chart))
+			fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Values:      "), orNA(r.Values))
+			fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Branch chart:"), orNA(r.ChartsBranch))
+
+			project := psn.ProjectForNamespace(r.Namespace)
+			if project == nil {
+				fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Progetto:    "),
+					ui.DimStyle.Render("nessuno — docker_root_path e psn.deployments"))
+				continue
+			}
+			fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Progetto:    "), orNA(project.DockerRoot))
+			branch := project.ExpectedBranch(c)
+			if branch == "" {
+				fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Branch build:"),
+					ui.DimStyle.Render("nessuno — si builda dalla copia di lavoro"))
+				continue
+			}
+			fmt.Printf("      %s  %s\n", ui.LabelStyle.Render("Branch build:"), ui.ValueStyle.Render(branch))
+		}
+	}
+
+	if len(psn.Projects) > 0 {
+		fmt.Println(ui.SectionStyle.Render("PSN · Progetti"))
+		for _, p := range psn.Projects {
+			fmt.Printf("\n  %s\n", ui.SelectedItemStyle.Render("["+p.Namespace+"]"))
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Docker root:   "), orNA(p.DockerRoot))
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Branch coll:   "), orNA(p.BranchColl))
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Branch prod:   "), orNA(p.BranchProd))
+			for _, dep := range slices.Sorted(maps.Keys(p.Deployments)) {
+				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Dockerfile:    "),
+					ui.ValueStyle.Render(dep+" → "+p.Deployments[dep]))
+			}
+		}
+	}
+
+	if len(psn.Deployments) > 0 {
+		fmt.Println(ui.SectionStyle.Render("PSN · Mapping deployment → servizio locale"))
+		for _, dep := range slices.Sorted(maps.Keys(psn.Deployments)) {
+			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render(fmt.Sprintf("%-15s", dep)),
+				ui.ValueStyle.Render(psn.Deployments[dep]))
+		}
+	}
 }
 
 var configSetRootCmd = &cobra.Command{
