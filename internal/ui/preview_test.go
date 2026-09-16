@@ -46,7 +46,6 @@ func TestPreviewRun(t *testing.T) {
 		fmt.Println(l)
 	}
 	fmt.Println(logDone("Progetto Docker", "origin/site-a-pre-prod", "1.3s"))
-	fmt.Println(logDone("Tag su ACR", psnRepoCount(3), "3.8s"))
 
 	fmt.Println(logServiceHeader(1, 3, "jboss-be", "3.0.10-dev", "3.0.10-dev"))
 	for _, l := range logWarn(
@@ -62,7 +61,7 @@ func TestPreviewRun(t *testing.T) {
 
 	// A tag typed by hand that ACR already holds, and the question it raises.
 	fmt.Println(logServiceHeader(2, 3, "jboss-fe", "3.0.11-dev", ""))
-	fmt.Println(logACRNote("3.0.12-dev", "3.0.13-dev"))
+	fmt.Println(logACRNote("3.0.12-dev"))
 	fmt.Println()
 	exists, _ := PSNWorkflowModel{
 		svc:          logic.HelmService{Name: "jboss-fe"},
@@ -71,6 +70,22 @@ func TestPreviewRun(t *testing.T) {
 		width:        100,
 	}.enterTagExists()
 	fmt.Println(exists.(PSNWorkflowModel).list.View().Content)
+
+	// The same service once the overwrite is confirmed.
+	overwritten, _ := PSNWorkflowModel{
+		svc:          logic.HelmService{Name: "jboss-fe"},
+		log:          []string{logServiceHeader(2, 3, "jboss-fe", "3.0.11-dev", ""), logACRNote("3.0.12-dev")},
+		selectedDeps: make([]string, 3),
+		depIdx:       1,
+		repo:         "exampleacr.azurecr.io/apps/jboss-fe",
+		oldTag:       "3.0.11-dev",
+		newTag:       "3.0.12-dev",
+		testUI:       true,
+		list:         listModel{selected: "overwrite"},
+	}.finishTagExists()
+	for _, l := range overwritten.(PSNWorkflowModel).log[:4] {
+		fmt.Println(l)
+	}
 
 	// The last service, its push refused once and taken on the second attempt.
 	fmt.Println(logServiceHeader(3, 3, "webapp", "3.0.9-dev", "3.0.10-dev"))
@@ -85,7 +100,9 @@ func TestPreviewRun(t *testing.T) {
 
 	fmt.Println(logSection("Rilascio", "app-site-a-coll"))
 	fmt.Println(logDone("helm upgrade", "3 servizi · 1 revisione", "7.4s"))
-	fmt.Println(logInfo("Mantenuti", "jboss-esb 3.0.11-dev"))
+	for _, l := range logKept([]logic.TagDrift{{Service: "jboss-esb", Deployed: "3.0.11-dev"}}) {
+		fmt.Println(l)
+	}
 	fmt.Println(logStep("↻", CursorStyle, "Riavvio jboss-be", "tag invariato", "18.4s"))
 	fmt.Println(logDone("Sync del values", "dev-site-a · 1 tag riallineato", "1.9s"))
 

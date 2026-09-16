@@ -69,7 +69,7 @@ func TestReleaseReadStartsFromTheDeployedTags(t *testing.T) {
 	}
 
 	log := stripANSI(strings.Join(m.log, "\n"))
-	for _, want := range []string{"values non allineato", "app-esb", "values 3.0.9-dev", "deployato 3.0.11-dev"} {
+	for _, want := range []string{"1 tag diverso dal values", "app-esb  3.0.9-dev nel values, 3.0.11-dev sul cluster"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("il log non riporta %q:\n%s", want, log)
 		}
@@ -123,7 +123,8 @@ func TestUpgradeKeepsWhatTheValuesMissed(t *testing.T) {
 	if footer := m.summaryFooter(); !strings.Contains(footer, "1 tag riallineato") {
 		t.Errorf("il riepilogo non dice del riallineamento: %q", footer)
 	}
-	if kept := psnKeptNote(m.pendingDrift()); kept != "app-esb 3.0.11-dev" {
+	kept := logKept(m.pendingDrift())
+	if len(kept) != 1 || stripANSI(kept[0]) != "     app-esb resta a 3.0.11-dev, come sul cluster" {
 		t.Errorf("tag mantenuti = %q", kept)
 	}
 }
@@ -150,7 +151,7 @@ func TestProposalStepsPastACR(t *testing.T) {
 		t.Errorf("valore nel campo = %q", got)
 	}
 	log := stripANSI(strings.Join(m.log, "\n"))
-	if !strings.Contains(log, "presente fino a 3.0.12-dev") {
+	if !strings.Contains(log, "Su ACR     tag immagine 3.0.12-dev già presente") {
 		t.Errorf("il salto della proposta non è spiegato:\n%s", log)
 	}
 
@@ -199,7 +200,7 @@ func TestExistingTagIsAskedAbout(t *testing.T) {
 	if kept.newTag != "3.0.12-dev" || kept.state == psnTagExists || kept.state == psnTagInput {
 		t.Errorf("sovrascrivi: tag %q, stato %v", kept.newTag, kept.state)
 	}
-	if log := stripANSI(strings.Join(kept.log, "\n")); !strings.Contains(log, "il push sostituisce") {
+	if log := stripANSI(strings.Join(kept.log, "\n")); !strings.Contains(log, "Il push sostituisce 3.0.12-dev su ACR.") {
 		t.Errorf("la sovrascrittura non è dichiarata:\n%s", log)
 	}
 	if header := stripANSI(kept.log[kept.svcLogStart]); !strings.Contains(header, "3.0.11-dev → 3.0.12-dev") {
@@ -248,6 +249,23 @@ func TestTagsLoadedWithErrors(t *testing.T) {
 	}
 }
 
+// A read that went through has nothing to report: the log goes straight to the
+// first service.
+func TestTagsLoadedQuietly(t *testing.T) {
+	m := readRelease(t, driftedModel(), psnReleaseReadMsg{})
+	m.selectedDeps = []string{"app-be"}
+	before := len(m.log)
+	next, _ := m.handleTagsLoaded(psnTagsLoadedMsg{
+		tags: map[string][]string{"acr.azurecr.io/demo/app-be": {"3.0.11-dev"}},
+	})
+	m = next.(PSNWorkflowModel)
+
+	if m.svcLogStart != before {
+		t.Errorf("prima della testata sono state aggiunte righe:\n%s",
+			stripANSI(strings.Join(m.log[before:m.svcLogStart], "\n")))
+	}
+}
+
 // The drift report keeps its tags in one column whatever the service names.
 func TestDriftLinesAlignTheirTags(t *testing.T) {
 	lines := logDrift([]logic.TagDrift{
@@ -256,15 +274,18 @@ func TestDriftLinesAlignTheirTags(t *testing.T) {
 		{Service: "app-be", Values: "3.0.9-dev", Deployed: "3.0.11-dev"},
 	}, "0.9s")
 
-	if len(lines) != 4 {
-		t.Fatalf("righe = %d, attese 4 (passo, due servizi, nota):\n%s", len(lines), stripANSI(strings.Join(lines, "\n")))
+	if len(lines) != 3 {
+		t.Fatalf("righe = %d, attese 3 (passo e due servizi):\n%s", len(lines), stripANSI(strings.Join(lines, "\n")))
+	}
+	if !strings.Contains(stripANSI(lines[0]), "2 tag diversi dal values") {
+		t.Errorf("passo = %q", stripANSI(lines[0]))
 	}
 	for _, l := range lines {
 		if w := lipgloss.Width(l); w > logWidth {
 			t.Errorf("riga larga %d, oltre la griglia (%d): %s", w, logWidth, stripANSI(l))
 		}
 	}
-	if strings.Index(stripANSI(lines[1]), "values") != strings.Index(stripANSI(lines[2]), "values") {
+	if strings.Index(stripANSI(lines[1]), "3.0.9-dev") != strings.Index(stripANSI(lines[2]), "1.0.0") {
 		t.Errorf("colonne disallineate:\n%s\n%s", stripANSI(lines[1]), stripANSI(lines[2]))
 	}
 }
@@ -294,7 +315,7 @@ func TestTestUIShowsAlignmentAndACRSkip(t *testing.T) {
 	if m.svc.Name != "webapp" || m.suggestedTag != "1.0.2" {
 		t.Errorf("webapp: proposto %q, atteso 1.0.2 (1.0.1 è già su ACR)", m.suggestedTag)
 	}
-	if !strings.Contains(stripANSI(strings.Join(m.log, "\n")), "presente fino a 1.0.1") {
+	if !strings.Contains(stripANSI(strings.Join(m.log, "\n")), "tag immagine 1.0.1 già presente") {
 		t.Errorf("il salto della proposta non si vede:\n%s", stripANSI(strings.Join(m.log, "\n")))
 	}
 }

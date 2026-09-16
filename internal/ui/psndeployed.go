@@ -3,7 +3,6 @@ package ui
 import (
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
 
 	"Hub-cli/internal/logic"
@@ -20,29 +19,37 @@ import (
 const psnReleaseLabel = "Release sul cluster"
 
 // logDrift reports the images whose values tag is not the one the release runs,
-// the two tags side by side, then what the run does about it.
+// one line each. What the run does about it is not explained here: it shows
+// where it happens, in the starting tag of each service and in the release.
 func logDrift(drift []logic.TagDrift, elapsed string) []string {
-	lines := []string{logWarnStep(psnReleaseLabel, "values non allineato", elapsed)}
+	// Two references of one image that lag the same way read as one fact.
+	var pairs []logic.TagDrift
+	for _, d := range drift {
+		same := func(p logic.TagDrift) bool {
+			return p.Service == d.Service && p.Values == d.Values && p.Deployed == d.Deployed
+		}
+		if !slices.ContainsFunc(pairs, same) {
+			pairs = append(pairs, d)
+		}
+	}
+
+	note := "1 tag diverso dal values"
+	if len(pairs) != 1 {
+		note = fmt.Sprintf("%d tag diversi dal values", len(pairs))
+	}
+	lines := []string{logWarnStep(psnReleaseLabel, note, elapsed)}
 
 	width := 0
-	for _, d := range drift {
+	for _, d := range pairs {
 		width = max(width, lipgloss.Width(d.Service))
 	}
-
-	// Two references of one image that lag the same way read as one fact.
-	var seen []string
-	for _, d := range drift {
-		pair := d.Service + " " + d.Values + " " + d.Deployed
-		if slices.Contains(seen, pair) {
-			continue
-		}
-		seen = append(seen, pair)
+	for _, d := range pairs {
 		lines = append(lines, "     "+ValueStyle.Render(d.Service)+
 			pad(lipgloss.Width(d.Service), width+2)+
-			DimStyle.Render("values ")+WarnStyle.Render(d.Values)+
-			DimStyle.Render("  ·  deployato ")+ValueStyle.Render(d.Deployed))
+			WarnStyle.Render(d.Values)+DimStyle.Render(" nel values, ")+
+			ValueStyle.Render(d.Deployed)+DimStyle.Render(" sul cluster"))
 	}
-	return append(lines, logDetail("Si parte dai tag deployati, e il sync li riporta nel values."))
+	return lines
 }
 
 // driftServices is one entry per image and tag realigned, for the commit message.
@@ -66,13 +73,13 @@ func helmSetArg(k logic.HelmImageKey, tag string) string {
 	return fmt.Sprintf("%s=%s", k.SetKey, tag)
 }
 
-// psnKeptNote lists the tags the upgrade kept as the cluster runs them.
-func psnKeptNote(drift []logic.TagDrift) string {
-	parts := make([]string, 0, len(drift))
+// logKept says, under the upgrade, which images kept the tag the cluster runs.
+func logKept(drift []logic.TagDrift) []string {
+	var lines []string
 	for _, s := range driftServices(drift) {
-		parts = append(parts, s.Name+" "+s.Tag)
+		lines = append(lines, logDetail(s.Name+" resta a "+s.Tag+", come sul cluster"))
 	}
-	return strings.Join(parts, ", ")
+	return lines
 }
 
 // psnRealignedNote counts the tags the sync wrote back without deploying them.
@@ -106,15 +113,10 @@ func fetchACRTags(repos []string) psnTagsLoadedMsg {
 	return msg
 }
 
-// psnRepoCount is the note of the ACR step.
-func psnRepoCount(n int) string {
-	return fmt.Sprintf("%d repository", n)
-}
-
 // logACRNote explains a proposal that skips ahead: ACR already holds an image
-// newer than the one running, and proposing its tag again would overwrite it.
-func logACRNote(highest, suggested string) string {
-	return logInfo("Su ACR", "presente fino a "+highest+"  ·  proposto "+suggested)
+// newer than the one running. The proposal itself is in the tag field.
+func logACRNote(highest string) string {
+	return logInfo("Su ACR", "tag immagine "+highest+" già presente")
 }
 
 // In --test-ui the release runs jboss-fe one tag ahead of the values, the way a

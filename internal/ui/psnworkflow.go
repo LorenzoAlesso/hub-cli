@@ -515,7 +515,7 @@ func (m PSNWorkflowModel) handleReleaseRead(msg psnReleaseReadMsg) (tea.Model, t
 	default:
 		m.drift = m.values.AlignToDeployed(msg.deployed)
 		if len(m.drift) == 0 {
-			m.log = append(m.log, logDone(psnReleaseLabel, "tag allineati al values", elapsed))
+			m.log = append(m.log, logDone(psnReleaseLabel, "allineato al values", elapsed))
 		} else {
 			m.log = append(m.log, logDrift(m.drift, elapsed)...)
 		}
@@ -727,24 +727,22 @@ func (m PSNWorkflowModel) enterTagsLoading() (tea.Model, tea.Cmd) {
 	})
 }
 
+// handleTagsLoaded logs the read only when it fails. A successful one has
+// nothing to report until a service needs it, and then it is said there.
 func (m PSNWorkflowModel) handleTagsLoaded(msg psnTagsLoadedMsg) (tea.Model, tea.Cmd) {
-	elapsed := formatElapsed(time.Since(m.opStart))
 	m.acrTags = msg.tags
-
 	if len(msg.errs) == 0 {
-		m.log = append(m.log, logDone("Tag su ACR", psnRepoCount(len(msg.tags)), elapsed))
 		return m.startNextDeployment()
 	}
 
 	// Unreadable tags do not stop the run: the check is a safeguard, and the
 	// push itself does not depend on it.
-	m.log = append(m.log, logWarnStep("Tag su ACR", "non verificabili", elapsed))
+	m.log = append(m.log, logWarnStep("Tag su ACR", "non verificabili", formatElapsed(time.Since(m.opStart))))
 	for _, name := range m.selectedDeps {
 		if err, ok := msg.errs[m.svcByName[name].Repository]; ok {
 			m.log = append(m.log, logDetail(name+": "+err.Error()))
 		}
 	}
-	m.log = append(m.log, logDetail("Per questi servizi il tag scelto non viene confrontato con ACR."))
 	return m.startNextDeployment()
 }
 
@@ -785,7 +783,7 @@ func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
 	}
 	m.suggestedTag = suggested
 	if plain, err := logic.IncrementPatch(m.oldTag); err == nil && plain != suggested {
-		m.log = append(m.log, logACRNote(logic.HighestInSeries(m.oldTag, existing), suggested))
+		m.log = append(m.log, logACRNote(logic.HighestInSeries(m.oldTag, existing)))
 	}
 	return m.enterTagInput()
 }
@@ -824,10 +822,11 @@ func (m PSNWorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 func (m PSNWorkflowModel) enterTagExists() (tea.Model, tea.Cmd) {
 	m.state = psnTagExists
 	m.list = listModel{
-		title: m.newTag + " esiste già su ACR per " + m.svc.Name,
+		// The service is named by the section the question sits in.
+		title: m.newTag + " esiste già su ACR",
 		items: []Item{
-			{Value: "change", Label: "Cambia tag", Desc: "torna alla scelta, proposto " + m.suggestedTag},
-			{Value: "overwrite", Label: "Sovrascrivi", Desc: "il push sostituisce l'immagine con quel tag"},
+			{Value: "change", Label: "Cambia tag", Desc: "propone " + m.suggestedTag},
+			{Value: "overwrite", Label: "Sovrascrivi", Desc: "il push sostituisce l'immagine esistente"},
 		},
 		width: m.width,
 	}
@@ -839,7 +838,7 @@ func (m PSNWorkflowModel) finishTagExists() (tea.Model, tea.Cmd) {
 		m.newTag = ""
 		return m.enterTagInput()
 	}
-	m.log = append(m.log, logWarn(m.newTag+" esiste già su ACR: il push sostituisce quell'immagine.")...)
+	m.log = append(m.log, logWarn("Il push sostituisce "+m.newTag+" su ACR.")...)
 	return m.acceptTag()
 }
 
@@ -1439,9 +1438,7 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 
 	case psnHelmDeploy:
 		m.log = append(m.log, logDone("helm upgrade", psnUpgradeNote(m.deployed), elapsed))
-		if pending := m.pendingDrift(); len(pending) > 0 {
-			m.log = append(m.log, logInfo("Mantenuti", psnKeptNote(pending)))
-		}
+		m.log = append(m.log, logKept(m.pendingDrift())...)
 		for _, d := range m.deployed {
 			m.results = append(m.results, DeployResult{
 				Service: d.svc.Name,
