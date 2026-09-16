@@ -323,3 +323,100 @@ func TestServiceDeploymentsSplitNamedFromUnnamed(t *testing.T) {
 		t.Errorf("senza nome = %v, atteso [initContainer]", unnamed)
 	}
 }
+
+// What `helm get values -o json` returns for a release installed from
+// sampleValues, after an upgrade that bumped jboss-be and initc with --set but
+// never wrote them back. jbossAmq is absent: a key the release does not carry
+// keeps the tag of the values file.
+func deployedSample() map[string]any {
+	return map[string]any{
+		"namespace":     "app-coll",
+		"initContainer": map[string]any{"image": "exampleacr.azurecr.io/apps/initc:1.0.1"},
+		"jbossBe": map[string]any{
+			"name":  "jboss-be",
+			"image": map[string]any{"repository": "exampleacr.azurecr.io/apps/jboss-be", "tag": "3.0.11-dev"},
+		},
+		"webapp": map[string]any{
+			"image": map[string]any{"repository": "exampleacr.azurecr.io/apps/webapp", "tag": "3.0.9-dev"},
+		},
+	}
+}
+
+// The deployed release wins: the current tag is the one running, and every
+// reference that disagreed is reported with both tags.
+func TestAlignToDeployed(t *testing.T) {
+	values, err := ReadHelmValues(writeValues(t, sampleValues))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drift := values.AlignToDeployed(deployedSample())
+
+	got := map[string]TagDrift{}
+	for _, d := range drift {
+		got[d.Service] = d
+	}
+	if len(drift) != 2 {
+		t.Fatalf("scostamenti = %+v, attesi 2 (initc e jboss-be)", drift)
+	}
+	if d := got["jboss-be"]; d.Values != "3.0.9-dev" || d.Deployed != "3.0.11-dev" || d.Key.SetKey != "jbossBe.image.tag" {
+		t.Errorf("jboss-be: %+v", d)
+	}
+	if d := got["initc"]; d.Values != "dev" || d.Deployed != "1.0.1" || d.Key.ImagePath == "" {
+		t.Errorf("initc: la forma inline deve portare il solo tag e il path: %+v", d)
+	}
+
+	tags := map[string]string{}
+	for _, s := range values.Services {
+		tags[s.Name] = s.Tag
+	}
+	want := map[string]string{"initc": "1.0.1", "jboss-amq": "1.0.0-dev", "jboss-be": "3.0.11-dev", "webapp": "3.0.9-dev"}
+	for name, tag := range want {
+		if tags[name] != tag {
+			t.Errorf("%s: tag corrente %q, atteso %q", name, tags[name], tag)
+		}
+	}
+}
+
+// Nothing deployed, nothing to align: a release installed for the first time
+// starts from the values file.
+func TestAlignToDeployedWithoutRelease(t *testing.T) {
+	values, err := ReadHelmValues(writeValues(t, sampleValues))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drift := values.AlignToDeployed(nil); len(drift) != 0 {
+		t.Errorf("scostamenti = %+v, attesi nessuno", drift)
+	}
+	if values.Services[2].Tag != "3.0.9-dev" {
+		t.Errorf("tag alterato: %q", values.Services[2].Tag)
+	}
+}
+
+// Two references of one image are compared one by one: the one left behind is
+// the one reported, and the service now disagrees with itself.
+func TestAlignToDeployedPerReference(t *testing.T) {
+	const values = `initContainer:
+  image: acr.azurecr.io/apps/initc:dev
+
+busybox:
+  name: cbox
+  image:
+    repository: acr.azurecr.io/apps/initc
+    tag: dev
+`
+	got, err := ReadHelmValues(writeValues(t, values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drift := got.AlignToDeployed(map[string]any{
+		"initContainer": map[string]any{"image": "acr.azurecr.io/apps/initc:dev"},
+		"busybox":       map[string]any{"image": map[string]any{"tag": "1.0.1"}},
+	})
+	if len(drift) != 1 || drift[0].Key.Key != "busybox" {
+		t.Fatalf("scostamenti = %+v, atteso solo busybox", drift)
+	}
+	if got.Services[0].TagsAgree() {
+		t.Error("dopo l'allineamento i due riferimenti divergono: TagsAgree dovrebbe essere false")
+	}
+}

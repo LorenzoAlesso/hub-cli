@@ -17,6 +17,7 @@ type HelmImageKey struct {
 	Key       string // top-level values key, e.g. "jbossBe"
 	SetKey    string // dotted path for `helm --set`, e.g. "jbossBe.image.tag"
 	ImagePath string
+	Tag       string // tag this reference declares
 
 	// Deployment is the `name` declared next to the image: the Kubernetes
 	// Deployment the templates build from this block. It often matches the image
@@ -102,6 +103,47 @@ func (v *HelmValues) add(ref helmImageRef) {
 	})
 }
 
+// TagDrift is an image reference whose tag in the values file is not the one
+// the deployed release runs: somebody deployed without writing the tag back.
+type TagDrift struct {
+	Service  string
+	Key      HelmImageKey
+	Values   string // tag the values file declares
+	Deployed string // tag the deployed revision runs
+}
+
+// AlignToDeployed makes the deployed release the source of the current tags:
+// every reference takes the tag the release runs, and the ones that differed
+// from the values file are returned. A reference the release does not carry
+// keeps the tag of the values file.
+//
+// A tag read from the values alone is not enough: an upgrade from it would roll
+// back whatever was deployed without being written back, and a new tag
+// incremented from it could name an image that already runs.
+func (v *HelmValues) AlignToDeployed(deployed map[string]any) []TagDrift {
+	var drift []TagDrift
+	for i := range v.Services {
+		svc := &v.Services[i]
+		for j := range svc.Keys {
+			key := &svc.Keys[j]
+			tag, err := TagAt(deployed, key.SetKey)
+			if err != nil || tag == "" || tag == key.Tag {
+				continue
+			}
+			drift = append(drift, TagDrift{Service: svc.Name, Key: *key, Values: key.Tag, Deployed: tag})
+			key.Tag = tag
+		}
+		svc.Tag = svc.Keys[0].Tag
+		svc.mixedTags = false
+		for _, k := range svc.Keys[1:] {
+			if k.Tag != svc.Tag {
+				svc.mixedTags = true
+			}
+		}
+	}
+	return drift
+}
+
 // Deployments lists the Kubernetes Deployments running this image, in values
 // order and without repeats, plus the values keys that name none: an image
 // referenced outside a Deployment cannot be restarted, and the caller has to say
@@ -168,7 +210,7 @@ func helmImageFrom(key string, node *yaml.Node) (helmImageRef, bool) {
 		return helmImageRef{
 			repository: repo.Value,
 			tag:        tag.Value,
-			key:        HelmImageKey{Key: key, SetKey: key + ".image.tag", Deployment: deployment},
+			key:        HelmImageKey{Key: key, SetKey: key + ".image.tag", Tag: tag.Value, Deployment: deployment},
 		}, true
 
 	case yaml.ScalarNode:
@@ -179,7 +221,7 @@ func helmImageFrom(key string, node *yaml.Node) (helmImageRef, bool) {
 		return helmImageRef{
 			repository: repo,
 			tag:        tag,
-			key:        HelmImageKey{Key: key, SetKey: key + ".image", ImagePath: repo, Deployment: deployment},
+			key:        HelmImageKey{Key: key, SetKey: key + ".image", ImagePath: repo, Tag: tag, Deployment: deployment},
 		}, true
 	}
 	return helmImageRef{}, false

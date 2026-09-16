@@ -40,7 +40,13 @@ func TestPreviewRun(t *testing.T) {
 	fmt.Println(logDone("Sessione Azure", "", "attiva"))
 	fmt.Println(logDone("Credenziali del cluster", "", "3.6s"))
 	fmt.Println(logDone("Chart", "origin/dev-site-a · 0.7.0", "1.3s"))
+	for _, l := range logDrift([]logic.TagDrift{
+		{Service: "jboss-esb", Values: "3.0.9-dev", Deployed: "3.0.11-dev"},
+	}, "0.9s") {
+		fmt.Println(l)
+	}
 	fmt.Println(logDone("Progetto Docker", "origin/site-a-pre-prod", "1.3s"))
+	fmt.Println(logDone("Tag su ACR", psnRepoCount(3), "3.8s"))
 
 	fmt.Println(logServiceHeader(1, 3, "jboss-be", "3.0.10-dev", "3.0.10-dev"))
 	for _, l := range logWarn(
@@ -53,6 +59,18 @@ func TestPreviewRun(t *testing.T) {
 	fmt.Println()
 	fmt.Println(logDone("Build", "", "2m 43s"))
 	fmt.Println(logDone("Push", "", "1m 04s"))
+
+	// A tag typed by hand that ACR already holds, and the question it raises.
+	fmt.Println(logServiceHeader(2, 3, "jboss-fe", "3.0.11-dev", ""))
+	fmt.Println(logACRNote("3.0.12-dev", "3.0.13-dev"))
+	fmt.Println()
+	exists, _ := PSNWorkflowModel{
+		svc:          logic.HelmService{Name: "jboss-fe"},
+		newTag:       "3.0.12-dev",
+		suggestedTag: "3.0.13-dev",
+		width:        100,
+	}.enterTagExists()
+	fmt.Println(exists.(PSNWorkflowModel).list.View().Content)
 
 	// The last service, its push refused once and taken on the second attempt.
 	fmt.Println(logServiceHeader(3, 3, "webapp", "3.0.9-dev", "3.0.10-dev"))
@@ -67,8 +85,9 @@ func TestPreviewRun(t *testing.T) {
 
 	fmt.Println(logSection("Rilascio", "app-site-a-coll"))
 	fmt.Println(logDone("helm upgrade", "3 servizi · 1 revisione", "7.4s"))
+	fmt.Println(logInfo("Mantenuti", "jboss-esb 3.0.11-dev"))
 	fmt.Println(logStep("↻", CursorStyle, "Riavvio jboss-be", "tag invariato", "18.4s"))
-	fmt.Println(logDone("Sync del values", "dev-site-a", "1.9s"))
+	fmt.Println(logDone("Sync del values", "dev-site-a · 1 tag riallineato", "1.9s"))
 
 	fmt.Println()
 	fmt.Println(questionBox(

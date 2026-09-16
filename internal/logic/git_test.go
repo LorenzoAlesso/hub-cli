@@ -271,3 +271,17 @@ func TestDeployCommitMessageFor(t *testing.T) {
 		t.Errorf("il trailer non deve finire nella prima riga: %q", subject)
 	}
 }
+
+// A tag realigned to the cluster is named in the body, not in the subject: the
+// subject says what this run deployed, and the realignment deployed nothing.
+func TestDeployCommitMessageAligned(t *testing.T) {
+	msg := DeployCommitMessageAligned(
+		[]DeployedService{{Name: "app-be", Tag: "3.0.12-dev"}},
+		[]DeployedService{{Name: "app-esb", Tag: "3.0.11-dev"}})
+	want := "chore(deploy): app-be → 3.0.12-dev\n\n" +
+		"Allineato a quanto già deployato: app-esb → 3.0.11-dev.\n\n" +
+		"Deploy eseguito con hub-cli."
+	if msg != want {
+		t.Errorf("messaggio = %q\natteso     %q", msg, want)
+	}
+}

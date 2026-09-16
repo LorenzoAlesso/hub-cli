@@ -21,10 +21,13 @@ type psnState int
 
 const (
 	psnChartsPrep psnState = iota
+	psnReleaseRead
 	psnRepoPrep
 	psnBranchSelect
 	psnDepSelect
+	psnTagsLoading
 	psnTagInput
+	psnTagExists
 	psnDockerfileList
 	psnDockerfileMissing
 	psnBuildArg
@@ -69,6 +72,18 @@ type psnSyncDoneMsg struct {
 	err error
 }
 
+type psnReleaseReadMsg struct {
+	deployed map[string]any
+	err      error
+}
+
+// psnTagsLoadedMsg carries, per repository, the tags already on ACR, or why
+// they could not be read.
+type psnTagsLoadedMsg struct {
+	tags map[string][]string
+	errs map[string]error
+}
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 // PSNWorkflowModel drives the PSN deploy pipeline. PSN is deployed with Helm,
@@ -95,7 +110,15 @@ type PSNWorkflowModel struct {
 
 	release   config.PSNReleaseConfig
 	chartsDir string           // managed clone of the charts repo
-	values    logic.HelmValues // what the release values declare
+	values    logic.HelmValues // what the release values declare, tags as deployed
+
+	// drift lists the references whose values tag was not the deployed one.
+	// The upgrade keeps them as they run and the sync writes them back.
+	drift []logic.TagDrift
+
+	// acrTags holds the tags each selected repository already has on ACR. A
+	// repository missing from it could not be read, and its tag is not checked.
+	acrTags map[string][]string
 
 	namespace     string
 	project       *config.PSNProjectConfig // per-namespace Dockerfile resolution override
@@ -191,6 +214,9 @@ func (m PSNWorkflowModel) summaryFooter() string {
 		parts = append(parts, "sync non riuscito")
 	case len(m.deployed) > 0 && !m.dryRun && !m.testUI:
 		parts = append(parts, "values su "+m.release.ChartsBranch)
+		if pending := m.pendingDrift(); len(pending) > 0 {
+			parts = append(parts, psnRealignedNote(pending))
+		}
 	}
 	return strings.Join(parts, "  ·  ")
 }
@@ -212,9 +238,9 @@ func psnFakeValues() logic.HelmValues {
 		Namespace: "demo-ns-col",
 		Services: []logic.HelmService{
 			{Name: "webapp", Repository: "demoacr.azurecr.io/demo/webapp", Tag: "1.0.0",
-				Keys: []logic.HelmImageKey{{Key: "webapp", SetKey: "webapp.image.tag", Deployment: "webapp"}}},
+				Keys: []logic.HelmImageKey{{Key: "webapp", SetKey: "webapp.image.tag", Tag: "1.0.0", Deployment: "webapp"}}},
 			{Name: "jboss-fe", Repository: "demoacr.azurecr.io/demo/jboss-fe", Tag: "2.1.3",
-				Keys: []logic.HelmImageKey{{Key: "jbossFe", SetKey: "jbossFe.image.tag", Deployment: "jboss-fe"}}},
+				Keys: []logic.HelmImageKey{{Key: "jbossFe", SetKey: "jbossFe.image.tag", Tag: "2.1.3", Deployment: "jboss-fe"}}},
 		},
 	}
 }
@@ -242,6 +268,12 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if cp, ok := msg.(psnChartsPrepDoneMsg); ok {
 		return m.handleChartsPrepDone(cp)
 	}
+	if rr, ok := msg.(psnReleaseReadMsg); ok {
+		return m.handleReleaseRead(rr)
+	}
+	if tl, ok := msg.(psnTagsLoadedMsg); ok {
+		return m.handleTagsLoaded(tl)
+	}
 	if sy, ok := msg.(psnSyncDoneMsg); ok {
 		elapsed := formatElapsed(time.Since(m.opStart))
 		if sy.err != nil {
@@ -249,7 +281,11 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.log = append(m.log, logWarn(m.release.ChartsBranch+
 				" non riflette il deploy: al prossimo helm upgrade i tag tornerebbero indietro.")...)
 		} else {
-			m.log = append(m.log, logDone("Sync del values", m.release.ChartsBranch, elapsed))
+			note := m.release.ChartsBranch
+			if pending := m.pendingDrift(); len(pending) > 0 {
+				note += " · " + psnRealignedNote(pending)
+			}
+			m.log = append(m.log, logDone("Sync del values", note, elapsed))
 		}
 		m.syncErr = sy.err
 		m.state = psnSummary
@@ -288,12 +324,12 @@ func (m PSNWorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
+	case psnChartsPrep, psnReleaseRead, psnRepoPrep, psnTagsLoading, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
 
-	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
+	case psnBranchSelect, psnTagExists, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
 		if m.list.quit {
@@ -304,6 +340,8 @@ func (m PSNWorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			case psnBranchSelect:
 				return m.finishProjectBranchSelect()
+			case psnTagExists:
+				return m.finishTagExists()
 			case psnDockerfileList:
 				return m.finishDockerfile()
 			case psnDockerfileMissing:
@@ -371,7 +409,7 @@ func (m PSNWorkflowModel) start() (tea.Model, tea.Cmd) {
 func (m PSNWorkflowModel) enterChartsPrep() (tea.Model, tea.Cmd) {
 	if m.testUI {
 		m.values = psnFakeValues()
-		return m.enterDepSelect()
+		return m.enterReleaseRead()
 	}
 
 	helmRoot := m.cfg.Config.HelmRootPath
@@ -430,7 +468,62 @@ func (m PSNWorkflowModel) handleChartsPrepDone(msg psnChartsPrepDoneMsg) (tea.Mo
 		m.log = append(m.log, logWarn(fmt.Sprintf(
 			"Il values dichiara namespace %q, la configurazione %q", values.Namespace, m.namespace))...)
 	}
+	return m.enterReleaseRead()
+}
 
+// ── Deployed release ──────────────────────────────────────────────────────────
+
+// enterReleaseRead reads the tags the release runs on the cluster, which are
+// where the run starts from: see psndeployed.go.
+func (m PSNWorkflowModel) enterReleaseRead() (tea.Model, tea.Cmd) {
+	if m.dryRun {
+		// The Azure phase is skipped in dry-run: kubectl does not point at the
+		// cluster, and reading from whatever it points at would compare the
+		// values with some other release.
+		m.log = append(m.log, wfDryRunLine(
+			logic.HelmGetValuesCommandLine(m.release.Name, m.namespace)+"  (confronto con il values)"))
+		return m.afterReleaseRead()
+	}
+
+	m.state = psnReleaseRead
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Lettura del release " + m.release.Name)
+	release, namespace, testUI := m.release.Name, m.namespace, m.testUI
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if testUI {
+			time.Sleep(800 * time.Millisecond)
+			return psnReleaseReadMsg{deployed: psnFakeDeployed()}
+		}
+		deployed, err := logic.ReleaseValues(release, namespace)
+		return psnReleaseReadMsg{deployed: deployed, err: err}
+	})
+}
+
+func (m PSNWorkflowModel) handleReleaseRead(msg psnReleaseReadMsg) (tea.Model, tea.Cmd) {
+	elapsed := formatElapsed(time.Since(m.opStart))
+
+	switch {
+	case errors.Is(msg.err, logic.ErrReleaseNotFound):
+		m.log = append(m.log, logDone(psnReleaseLabel, "non ancora installato", elapsed))
+	case msg.err != nil:
+		// Not a reason to stop: the values are still a sound starting point,
+		// only no longer a verified one — and the log says so.
+		m.log = append(m.log,
+			logWarnStep(psnReleaseLabel, "tag deployati non leggibili", elapsed),
+			logDetail(msg.err.Error()),
+			logDetail("Si parte dai tag del values: verificarli prima di confermare."))
+	default:
+		m.drift = m.values.AlignToDeployed(msg.deployed)
+		if len(m.drift) == 0 {
+			m.log = append(m.log, logDone(psnReleaseLabel, "tag allineati al values", elapsed))
+		} else {
+			m.log = append(m.log, logDrift(m.drift, elapsed)...)
+		}
+	}
+	return m.afterReleaseRead()
+}
+
+func (m PSNWorkflowModel) afterReleaseRead() (tea.Model, tea.Cmd) {
 	if m.project != nil {
 		// With a branch declared the configured path only supplies the remote
 		// URL: the build reads from the managed clone aligned right after.
@@ -539,11 +632,14 @@ func (m PSNWorkflowModel) enterDepSelect() (tea.Model, tea.Cmd) {
 	for _, svc := range m.values.Services {
 		m.svcByName[svc.Name] = svc
 		desc := svc.Tag
+		if from := m.valuesTagOf(svc.Name); from != "" {
+			desc += "  ·  nel values " + from
+		}
 		if len(svc.Keys) > 1 {
 			desc += fmt.Sprintf("  ·  %d riferimenti", len(svc.Keys))
 		}
 		if !svc.TagsAgree() {
-			desc += "  ·  tag divergenti nel values"
+			desc += "  ·  tag divergenti"
 		}
 		items = append(items, Item{Value: svc.Name, Label: svc.Name, Desc: desc})
 	}
@@ -571,6 +667,84 @@ func (m PSNWorkflowModel) finishDepSelect() (tea.Model, tea.Cmd) {
 	}
 	m.selectedDeps = selected
 	m.depIdx = 0
+	return m.enterTagsLoading()
+}
+
+// valuesTagOf returns the tag the values file declared for a service the
+// release runs with another one, or "" when the two agree.
+func (m PSNWorkflowModel) valuesTagOf(service string) string {
+	for _, d := range m.drift {
+		if d.Service == service {
+			return d.Values
+		}
+	}
+	return ""
+}
+
+// pendingDrift is the drift no image of this run replaces: the references the
+// upgrade has to keep as they run, and the sync has to write back.
+func (m PSNWorkflowModel) pendingDrift() []logic.TagDrift {
+	var out []logic.TagDrift
+	for _, d := range m.drift {
+		redeployed := slices.ContainsFunc(m.deployed, func(p psnDeployed) bool {
+			return p.svc.Name == d.Service
+		})
+		if !redeployed {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// ── Tags already on ACR ───────────────────────────────────────────────────────
+
+// enterTagsLoading reads the tags each selected image already has on ACR, for
+// all of them before the first question: a proposal must not name an existing
+// image, and a chosen tag that does is asked about before the push replaces it.
+func (m PSNWorkflowModel) enterTagsLoading() (tea.Model, tea.Cmd) {
+	repos := make([]string, 0, len(m.selectedDeps))
+	for _, name := range m.selectedDeps {
+		repos = append(repos, m.svcByName[name].Repository)
+	}
+
+	if m.dryRun {
+		for _, repo := range repos {
+			m.log = append(m.log, wfDryRunLine(logic.ACRTagsCommandLine(repo)))
+		}
+		return m.startNextDeployment()
+	}
+
+	m.state = psnTagsLoading
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Lettura dei tag su ACR")
+	testUI := m.testUI
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if testUI {
+			time.Sleep(1200 * time.Millisecond)
+			return psnTagsLoadedMsg{tags: psnFakeACRTags(repos)}
+		}
+		return fetchACRTags(repos)
+	})
+}
+
+func (m PSNWorkflowModel) handleTagsLoaded(msg psnTagsLoadedMsg) (tea.Model, tea.Cmd) {
+	elapsed := formatElapsed(time.Since(m.opStart))
+	m.acrTags = msg.tags
+
+	if len(msg.errs) == 0 {
+		m.log = append(m.log, logDone("Tag su ACR", psnRepoCount(len(msg.tags)), elapsed))
+		return m.startNextDeployment()
+	}
+
+	// Unreadable tags do not stop the run: the check is a safeguard, and the
+	// push itself does not depend on it.
+	m.log = append(m.log, logWarnStep("Tag su ACR", "non verificabili", elapsed))
+	for _, name := range m.selectedDeps {
+		if err, ok := msg.errs[m.svcByName[name].Repository]; ok {
+			m.log = append(m.log, logDetail(name+": "+err.Error()))
+		}
+	}
+	m.log = append(m.log, logDetail("Per questi servizi il tag scelto non viene confrontato con ACR."))
 	return m.startNextDeployment()
 }
 
@@ -601,6 +775,18 @@ func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
 	// it belongs to, not above it.
 	m.svcLogStart = len(m.log)
 	m.log = append(m.log, m.serviceHeader())
+
+	// The proposal steps past what ACR already holds; when that is more than a
+	// plain increment, the jump is explained before it is offered.
+	existing := m.acrTags[m.repo]
+	suggested, err := logic.NextTag(m.oldTag, existing)
+	if err != nil {
+		suggested = m.oldTag
+	}
+	m.suggestedTag = suggested
+	if plain, err := logic.IncrementPatch(m.oldTag); err == nil && plain != suggested {
+		m.log = append(m.log, logACRNote(logic.HighestInSeries(m.oldTag, existing), suggested))
+	}
 	return m.enterTagInput()
 }
 
@@ -608,12 +794,7 @@ func (m PSNWorkflowModel) startNextDeployment() (tea.Model, tea.Cmd) {
 
 func (m PSNWorkflowModel) enterTagInput() (tea.Model, tea.Cmd) {
 	m.state = psnTagInput
-	suggested, err := logic.IncrementPatch(m.oldTag)
-	if err != nil {
-		suggested = m.oldTag
-	}
-	m.suggestedTag = suggested
-	m.input = newInputModel("Tag immagine", suggested, suggested)
+	m.input = newInputModel("Tag immagine", m.suggestedTag, m.suggestedTag)
 	m.input.width = m.width
 	return m, m.input.Init()
 }
@@ -631,6 +812,40 @@ func (m PSNWorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	}
 	m.newTag = val
 
+	// A tag already on ACR, other than the one running, names an image the push
+	// would replace — one built for something else, or not deployed yet. The
+	// header stays pending while that is asked: the tag is not chosen yet.
+	if m.newTag != m.oldTag && slices.Contains(m.acrTags[m.repo], m.newTag) {
+		return m.enterTagExists()
+	}
+	return m.acceptTag()
+}
+
+func (m PSNWorkflowModel) enterTagExists() (tea.Model, tea.Cmd) {
+	m.state = psnTagExists
+	m.list = listModel{
+		title: m.newTag + " esiste già su ACR per " + m.svc.Name,
+		items: []Item{
+			{Value: "change", Label: "Cambia tag", Desc: "torna alla scelta, proposto " + m.suggestedTag},
+			{Value: "overwrite", Label: "Sovrascrivi", Desc: "il push sostituisce l'immagine con quel tag"},
+		},
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m PSNWorkflowModel) finishTagExists() (tea.Model, tea.Cmd) {
+	if m.list.selected != "overwrite" {
+		m.newTag = ""
+		return m.enterTagInput()
+	}
+	m.log = append(m.log, logWarn(m.newTag+" esiste già su ACR: il push sostituisce quell'immagine.")...)
+	return m.acceptTag()
+}
+
+// acceptTag goes on with the tag chosen for the service in hand, completing its
+// header where it stands.
+func (m PSNWorkflowModel) acceptTag() (tea.Model, tea.Cmd) {
 	m.log[m.svcLogStart] = m.serviceHeader()
 
 	// Redeploying the same tag overwrites the image on ACR, but helm renders an
@@ -644,7 +859,7 @@ func (m PSNWorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	}
 	if !m.svc.TagsAgree() {
 		m.log = append(m.log, logWarn(
-			"Il values dichiara tag diversi per la stessa immagine.",
+			"I riferimenti alla stessa immagine hanno tag diversi.",
 			"Verranno allineati tutti al nuovo tag.")...)
 	}
 	m.log = append(m.log, logInfo("Immagine", m.repo+":"+m.oldTag))
@@ -962,16 +1177,17 @@ func (m PSNWorkflowModel) enterHelmDeploy() (tea.Model, tea.Cmd) {
 
 // helmSetArgs is one --set per values key of every image bumped. An image
 // referenced twice gets both its keys, or the two references would drift apart.
+// A reference whose values tag lags the cluster keeps the tag it runs: the
+// upgrade reads the values file, and would otherwise roll it back.
 func (m PSNWorkflowModel) helmSetArgs() []string {
 	var args []string
 	for _, d := range m.deployed {
 		for _, k := range d.svc.Keys {
-			if k.ImagePath != "" {
-				args = append(args, fmt.Sprintf("%s=%s:%s", k.SetKey, k.ImagePath, d.newTag))
-			} else {
-				args = append(args, fmt.Sprintf("%s=%s", k.SetKey, d.newTag))
-			}
+			args = append(args, helmSetArg(k, d.newTag))
 		}
+	}
+	for _, d := range m.pendingDrift() {
+		args = append(args, helmSetArg(d.Key, d.Deployed))
 	}
 	return args
 }
@@ -1108,10 +1324,11 @@ func (m PSNWorkflowModel) enterSync() (tea.Model, tea.Cmd) {
 	m.spinner = newSpinnerModel("Sync del values su " + m.release.ChartsBranch)
 
 	deployed := m.deployed
+	pending := m.pendingDrift()
 	valuesRel := m.release.Values
 	branch := m.release.ChartsBranch
 	reposRoot := config.GetReposRoot()
-	message := logic.DeployCommitMessageFor(psnDeployedServices(deployed))
+	message := logic.DeployCommitMessageAligned(psnDeployedServices(deployed), driftServices(pending))
 
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
 		err := logic.SyncToBranch(remoteURL, branch, reposRoot, message,
@@ -1122,6 +1339,11 @@ func (m PSNWorkflowModel) enterSync() (tea.Model, tea.Cmd) {
 						if err := logic.UpdateHelmValuesTag(path, k.SetKey, d.newTag, k.ImagePath); err != nil {
 							return nil, fmt.Errorf("%s: %w", d.svc.Name, err)
 						}
+					}
+				}
+				for _, d := range pending {
+					if err := logic.UpdateHelmValuesTag(path, d.Key.SetKey, d.Deployed, d.Key.ImagePath); err != nil {
+						return nil, fmt.Errorf("%s: %w", d.Service, err)
 					}
 				}
 				return []string{valuesRel}, nil
@@ -1217,6 +1439,9 @@ func (m PSNWorkflowModel) handleOpDone(msg psnOpDoneMsg) (tea.Model, tea.Cmd) {
 
 	case psnHelmDeploy:
 		m.log = append(m.log, logDone("helm upgrade", psnUpgradeNote(m.deployed), elapsed))
+		if pending := m.pendingDrift(); len(pending) > 0 {
+			m.log = append(m.log, logInfo("Mantenuti", psnKeptNote(pending)))
+		}
 		for _, d := range m.deployed {
 			m.results = append(m.results, DeployResult{
 				Service: d.svc.Name,
@@ -1245,7 +1470,7 @@ func (m PSNWorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case psnChartsPrep, psnRepoPrep, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
+	case psnChartsPrep, psnReleaseRead, psnRepoPrep, psnTagsLoading, psnBuilding, psnPushing, psnHelmDeploy, psnRestarting, psnSync:
 		// A run stopped mid-step quits in that step's state: the final frame
 		// must not show it as still running under the error that ended it.
 		if !m.cancelled {
@@ -1253,7 +1478,7 @@ func (m PSNWorkflowModel) View() tea.View {
 				formatElapsed(time.Since(m.opStart))) + "\n")
 		}
 	// A question stands off the log it interrupts, instead of continuing it.
-	case psnBranchSelect, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
+	case psnBranchSelect, psnTagExists, psnDockerfileList, psnDockerfileMissing, psnPushError, psnDeployError, psnRestartConfirm:
 		sb.WriteString("\n" + m.list.View().Content)
 	case psnDepSelect:
 		sb.WriteString("\n" + m.multisel.View().Content)
@@ -1282,8 +1507,8 @@ func (m PSNWorkflowModel) renderTracker() string {
 
 	// Named for what this phase does, not for what used to be chosen here: the
 	// release is picked before the TUI starts, and what is left is the chart repo
-	// being aligned and its values read.
-	if m.state == psnChartsPrep {
+	// being aligned, its values read and compared with the deployed release.
+	if m.state == psnChartsPrep || m.state == psnReleaseRead {
 		tabs = append(tabs, trackerTab(trackSpinning, "Chart", frame))
 	} else {
 		tabs = append(tabs, trackerTab(trackDone, "Chart", frame))
@@ -1294,6 +1519,8 @@ func (m PSNWorkflowModel) renderTracker() string {
 		tabs = append(tabs, trackerTab(trackPending, "Servizi", frame))
 	case m.state == psnDepSelect:
 		tabs = append(tabs, trackerTab(trackInteractive, "Servizi", frame))
+	case m.state == psnTagsLoading:
+		tabs = append(tabs, trackerTab(trackSpinning, "Servizi", frame))
 	default:
 		tabs = append(tabs, trackerTab(trackDone, "Servizi", frame))
 	}

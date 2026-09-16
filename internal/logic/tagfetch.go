@@ -1,32 +1,52 @@
 package logic
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
 )
 
-// GetDeployedTag returns the currently deployed tag for a Helm release.
-// helmSetKey may point to a plain tag ("<path>.tag") or to a full image
-// reference ("<path>.image", value "<prefix>/<name>:<tag>"); in the latter
-// case only the tag portion is returned.
-func GetDeployedTag(releaseName, namespace, helmSetKey string) (string, error) {
-	out, err := exec.Command(
+// ErrReleaseNotFound means the release has never been installed in the namespace.
+var ErrReleaseNotFound = errors.New("release non installato")
+
+// ReleaseValues reads the values the deployed revision of a release runs with:
+// the values file and every --set of the last upgrade, merged by Helm.
+func ReleaseValues(releaseName, namespace string) (map[string]any, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command(
 		"helm", "get", "values", releaseName,
 		"--namespace", namespace,
 		"-o", "json",
-	).Output()
+	)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("helm get values fallito: %w", err)
+		detail := strings.TrimSpace(stderr.String())
+		if strings.Contains(detail, "release: not found") {
+			return nil, ErrReleaseNotFound
+		}
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, fmt.Errorf("helm get values fallito: %s", detail)
 	}
 
-	var values map[string]interface{}
+	var values map[string]any
 	if err := json.Unmarshal(out, &values); err != nil {
-		return "", fmt.Errorf("parsing JSON helm values: %w", err)
+		return nil, fmt.Errorf("parsing JSON helm values: %w", err)
 	}
+	return values, nil
+}
 
+// TagAt returns the tag stored at helmSetKey in release values. The key may
+// point to a plain tag ("<path>.tag") or to a full image reference
+// ("<path>.image", value "<prefix>/<name>:<tag>"); in the latter case only the
+// tag portion is returned.
+func TagAt(values map[string]any, helmSetKey string) (string, error) {
 	raw, err := navigateJSON(values, helmSetKey)
 	if err != nil {
 		return "", err
@@ -51,6 +71,15 @@ func GetDeployedTag(releaseName, namespace, helmSetKey string) (string, error) {
 	}
 
 	return str, nil
+}
+
+// GetDeployedTag returns the currently deployed tag for a Helm release.
+func GetDeployedTag(releaseName, namespace, helmSetKey string) (string, error) {
+	values, err := ReleaseValues(releaseName, namespace)
+	if err != nil {
+		return "", err
+	}
+	return TagAt(values, helmSetKey)
 }
 
 // GetDeployedChartVersion returns the chart version currently deployed for a release.
@@ -87,7 +116,12 @@ func GetDeployedChartVersion(releaseName, namespace string) (string, error) {
 	return "", fmt.Errorf("impossibile estrarre la versione dal chart %q", chart)
 }
 
-func navigateJSON(data map[string]interface{}, dotPath string) (interface{}, error) {
+// HelmGetValuesCommandLine renders the command ReleaseValues would run, for --dry-run.
+func HelmGetValuesCommandLine(releaseName, namespace string) string {
+	return fmt.Sprintf("helm get values %s --namespace %s -o json", releaseName, namespace)
+}
+
+func navigateJSON(data map[string]any, dotPath string) (any, error) {
 	parts := strings.SplitN(dotPath, ".", 2)
 	val, ok := data[parts[0]]
 	if !ok {
@@ -96,7 +130,7 @@ func navigateJSON(data map[string]interface{}, dotPath string) (interface{}, err
 	if len(parts) == 1 {
 		return val, nil
 	}
-	nested, ok := val.(map[string]interface{})
+	nested, ok := val.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("percorso %q: %q non è un oggetto", dotPath, parts[0])
 	}

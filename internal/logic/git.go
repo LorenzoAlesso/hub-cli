@@ -82,11 +82,26 @@ const deployCommitTrailer = "Deploy eseguito con hub-cli."
 // DeployCommitMessageFor builds one message for every service deployed in a
 // run: a single commit per workflow means fewer pushes and fewer races.
 func DeployCommitMessageFor(services []DeployedService) string {
+	return DeployCommitMessageAligned(services, nil)
+}
+
+// DeployCommitMessageAligned also names the tags written back as the cluster
+// already ran them: a change to the values nobody deployed in this run, which
+// whoever reads the branch history should not have to reverse-engineer.
+func DeployCommitMessageAligned(services, aligned []DeployedService) string {
+	msg := "chore(deploy): " + joinDeployed(services) + "\n\n"
+	if len(aligned) > 0 {
+		msg += "Allineato a quanto già deployato: " + joinDeployed(aligned) + ".\n\n"
+	}
+	return msg + deployCommitTrailer
+}
+
+func joinDeployed(services []DeployedService) string {
 	parts := make([]string, 0, len(services))
 	for _, svc := range services {
 		parts = append(parts, fmt.Sprintf("%s → %s", svc.Name, svc.Tag))
 	}
-	return "chore(deploy): " + strings.Join(parts, ", ") + "\n\n" + deployCommitTrailer
+	return strings.Join(parts, ", ")
 }
 
 // GitCurrentBranch returns the checked-out branch of the given repository.
