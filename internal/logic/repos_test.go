@@ -11,12 +11,12 @@ import (
 
 func TestRepoSlug(t *testing.T) {
 	cases := map[string]string{
-		"https://github.com/ACME/docker.git":            "ACME-docker",
-		"https://github.com/ACME/docker":                "ACME-docker",
-		"git@github.com:ACME/docker.git":                "ACME-docker",
-		"ssh://git@github.com/ACME/docker.git":          "ACME-docker",
+		"https://github.com/ACME/docker.git":          "ACME-docker",
+		"https://github.com/ACME/docker":              "ACME-docker",
+		"git@github.com:ACME/docker.git":              "ACME-docker",
+		"ssh://git@github.com/ACME/docker.git":        "ACME-docker",
 		"https://github.com/ACME-B/docker-images.git": "ACME-B-docker-images",
-		"https://dev.azure.com/org/project/_git/repo":      "org-project-_git-repo",
+		"https://dev.azure.com/org/project/_git/repo": "org-project-_git-repo",
 	}
 	for in, want := range cases {
 		if got := RepoSlug(in); got != want {

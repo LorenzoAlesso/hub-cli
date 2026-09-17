@@ -30,7 +30,7 @@ func TestBranchChoicesPutContainingFirst(t *testing.T) {
 // The hint names where the Dockerfile is, and says so plainly when it is nowhere.
 func TestBranchHint(t *testing.T) {
 	cases := map[string][]string{
-		"presente su: app-dev":                   {"app-dev"},
+		"presente su: app-dev":                    {"app-dev"},
 		"presente su: a, b, c e altri 2":          {"a", "b", "c", "d", "e"},
 		"non presente in nessun branch di origin": nil,
 	}
