@@ -6,7 +6,8 @@ It handles ECR login, Docker build, image push, and Helm upgrade for one or more
 
 ## Requirements
 
-- `docker`, `kubectl`, `helm`, `aws` available in `PATH`
+- `docker`, `kubectl`, `helm`, `aws`, `git` available in `PATH`
+- `az` (Azure CLI) available in `PATH`, for `hub-cli psn`
 - AWS ECR access configured
 
 ## Installation
@@ -42,7 +43,8 @@ Gestisce il login ECR, la build Docker, il push e l'upgrade Helm per uno o più 
 
 ## Prerequisiti
 
-- `docker`, `kubectl`, `helm`, `aws` disponibili nel `PATH`
+- `docker`, `kubectl`, `helm`, `aws`, `git` disponibili nel `PATH`
+- `az` (Azure CLI) disponibile nel `PATH`, per `hub-cli psn`
 - Accesso configurato ad AWS ECR
 
 ## Installazione

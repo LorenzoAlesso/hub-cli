@@ -845,7 +845,7 @@ func (m WorkflowModel) finishDockerfileMissing() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-// ── Cambio del branch Docker a metà servizio ──────────────────────────────────
+// ── Docker branch switch mid-service ──────────────────────────────────────────
 
 // canSwitchDockerBranch reports whether the Docker branch can be changed from
 // the missing-Dockerfile question. hub-cli moves its own clone between branches,
@@ -1384,7 +1384,7 @@ func (m WorkflowModel) enterPostSync() (tea.Model, tea.Cmd) {
 	})
 }
 
-// ── Restart a tag invariato ───────────────────────────────────────────────────
+// ── Restart on an unchanged tag ───────────────────────────────────────────────
 
 // resolveRestartTarget reads the Deployment name out of the values block this
 // service deploys to. The name is not the values key and not the service name:
