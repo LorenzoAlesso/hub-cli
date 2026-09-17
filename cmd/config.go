@@ -18,55 +18,6 @@ var configCmd = &cobra.Command{
 	Short: "Gestione configurazione hub-cli",
 }
 
-var configShowCmd = &cobra.Command{
-	Use:   "show",
-	Short: "Mostra la configurazione corrente",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		fmt.Println(ui.SectionStyle.Render("Configurazione Globale"))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("File:           "), ui.ValueStyle.Render(config.GetFilePath()))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Docker Root:    "), orNA(cfg.Config.DockerRootPath))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Helm Root:      "), orNA(cfg.Config.HelmRootPath))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("ECR Region:     "), ui.ValueStyle.Render(cfg.Config.ECRRegion))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("ECR Account:    "), ui.ValueStyle.Render(cfg.Config.ECRAccountID))
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Chart Version:  "), ui.ValueStyle.Render(cfg.Config.ChartVersion))
-		themeVal := cfg.Config.Theme
-		if themeVal == "" {
-			themeVal = "auto"
-		}
-		fmt.Printf("  %s  %s\n", ui.LabelStyle.Render("Tema:           "), ui.ValueStyle.Render(themeVal))
-
-		if len(cfg.Services) == 0 {
-			fmt.Println(ui.WarnStyle.Render("\nNessun servizio configurato."))
-			return nil
-		}
-
-		fmt.Println(ui.SectionStyle.Render("\nServizi"))
-		for name, svc := range cfg.Services {
-			fmt.Printf("\n  %s\n", ui.SelectedItemStyle.Render("["+name+"]"))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Last Tag:      "), orNA(svc.LastTag))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Dockerfile:    "), orNA(svc.DockerfileSubpath))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Helm Values:   "), orNA(svc.HelmValuesPath))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Namespace:     "), orNA(svc.Namespace))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Chart:         "), orNA(svc.ChartName))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Release:       "), orNA(svc.ReleaseName))
-			fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("ECR Repo:      "), orNA(svc.ECRRepository))
-			if svc.HelmImagePath != "" {
-				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("Helm Image:    "), ui.ValueStyle.Render(svc.HelmImagePath))
-			}
-			if svc.K8sManifestPath != "" {
-				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("K8s Manifest:  "), ui.ValueStyle.Render(svc.K8sManifestPath))
-				fmt.Printf("    %s  %s\n", ui.LabelStyle.Render("K8s Image Ref: "), ui.ValueStyle.Render(svc.K8sImageRef))
-			}
-		}
-		return nil
-	},
-}
-
 var configSetRootCmd = &cobra.Command{
 	Use:   "set-root",
 	Short: "Aggiorna i percorsi base Docker e Helm",

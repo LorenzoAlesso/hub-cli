@@ -1,0 +1,124 @@
+package logic
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+// AZIsLoggedIn reports whether an Azure CLI session is currently active.
+func AZIsLoggedIn() bool {
+	cmd := exec.Command("az", "account", "show", "--query", "id", "-o", "tsv")
+	return cmd.Run() == nil
+}
+
+// AZLogin runs `az login` for the given tenant. It is interactive (browser /
+// device code) so it writes straight to the terminal — run it outside the TUI.
+// Stdin receives "\n" so the subscription prompt accepts the default — the
+// correct subscription is then set explicitly via AZSetSubscription.
+func AZLogin(tenantID string) error {
+	cmd := exec.Command("az", "login", "--tenant", tenantID)
+	cmd.Stdin = bytes.NewBufferString("\n")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("az login fallito: %w", err)
+	}
+	return nil
+}
+
+// AZSetSubscription sets the active Azure subscription.
+func AZSetSubscription(subscriptionID string) error {
+	var stderr bytes.Buffer
+	cmd := exec.Command("az", "account", "set", "--subscription", subscriptionID)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("az account set fallito: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// AZGetAKSCredentials fetches kubectl credentials for the given AKS cluster
+// and switches the current kube context to it.
+func AZGetAKSCredentials(resourceGroup, clusterName string, out io.Writer) error {
+	cmd := exec.Command(
+		"az", "aks", "get-credentials",
+		"--resource-group", resourceGroup,
+		"--name", clusterName,
+		"--overwrite-existing",
+	)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("az aks get-credentials fallito: %w", err)
+	}
+	return nil
+}
+
+// ACRTags lists the tags a repository holds on Azure Container Registry.
+// repository is the full reference without tag, "<registry>.azurecr.io/<path>".
+// A repository that does not exist yet has no tags, which is not an error:
+// the first push creates it.
+func ACRTags(repository string) ([]string, error) {
+	registry, path, err := splitACRRepository(repository)
+	if err != nil {
+		return nil, err
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command("az", "acr", "repository", "show-tags",
+		"--name", registry, "--repository", path, "-o", "json")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if strings.Contains(detail, "repository") && strings.Contains(detail, "is not found") {
+			return nil, nil
+		}
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, fmt.Errorf("lettura dei tag di %s fallita: %s", repository, detail)
+	}
+
+	var tags []string
+	if err := json.Unmarshal(out, &tags); err != nil {
+		return nil, fmt.Errorf("parsing dei tag di %s: %w", repository, err)
+	}
+	return tags, nil
+}
+
+// ACRTagsCommandLine renders the command ACRTags would run, for --dry-run.
+func ACRTagsCommandLine(repository string) string {
+	registry, path, err := splitACRRepository(repository)
+	if err != nil {
+		return "az acr repository show-tags  # " + err.Error()
+	}
+	return fmt.Sprintf("az acr repository show-tags --name %s --repository %s", registry, path)
+}
+
+// splitACRRepository takes the registry name from the login server rather than
+// from the cluster configuration: the values file says where each image lives.
+func splitACRRepository(repository string) (registry, path string, err error) {
+	host, path, ok := strings.Cut(repository, "/")
+	registry, isACR := strings.CutSuffix(host, ".azurecr.io")
+	if !ok || !isACR || registry == "" || path == "" {
+		return "", "", fmt.Errorf("%s non è un repository ACR", repository)
+	}
+	return registry, path, nil
+}
+
+// ACRLogin runs `az acr login` for the given registry.
+func ACRLogin(acrName string, out io.Writer) error {
+	cmd := exec.Command("az", "acr", "login", "--name", acrName)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("az acr login fallito: %w", err)
+	}
+	return nil
+}

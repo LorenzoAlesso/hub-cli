@@ -88,7 +88,7 @@ func (m confirmModel) View() tea.View {
 	btnSi := confirmButton("  Sì  ", m.choice == 0)
 	btnNo := confirmButton("  No  ", m.choice == 1)
 	sb.WriteString("  " + lipgloss.JoinHorizontal(lipgloss.Center, btnSi, "   ", btnNo) + "\n\n")
-	sb.WriteString(HelpStyle.Render("  ← → naviga · enter conferma · esc annulla"))
+	sb.WriteString(HelpStyle.Render("← → naviga · enter conferma · esc annulla"))
 
 	w := m.width
 	if w == 0 {

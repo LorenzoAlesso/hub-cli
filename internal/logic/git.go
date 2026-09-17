@@ -1,50 +1,116 @@
 package logic
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
-	"os"
 	"os/exec"
+	"strings"
 )
 
-// GitAdd stages specific files in the given repository.
-func GitAdd(repoPath string, files ...string) error {
-	args := append([]string{"add", "--"}, files...)
+// ErrNothingToCommit means a redeploy of the same tag left the files unchanged.
+var ErrNothingToCommit = errors.New("nessuna modifica da committare")
+
+// ErrPushRejected means origin moved ahead: the signal to realign and re-apply.
+var ErrPushRejected = errors.New("push rifiutato: il branch remoto è più avanti")
+
+// GitCommitFiles commits the working-tree state of the given files and nothing
+// else: unlike a plain "git commit", the pathspec form cannot sweep in
+// unrelated staged work. Returns ErrNothingToCommit when they already match.
+func GitCommitFiles(repoPath, message string, files ...string) error {
+	if len(files) == 0 {
+		return ErrNothingToCommit
+	}
+
+	args := append([]string{"commit", "-m", message, "--"}, files...)
+	var combined bytes.Buffer
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git add fallito in %s: %w", repoPath, err)
+		detail := strings.TrimSpace(combined.String())
+		if strings.Contains(detail, "nothing to commit") ||
+			strings.Contains(detail, "no changes added to commit") {
+			return ErrNothingToCommit
+		}
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("git commit fallito in %s: %s", repoPath, detail)
 	}
 	return nil
 }
 
-// GitCommit creates a conventional commit in the given repository.
-// Expected format: "chore(deploy): <service> → <new-tag>".
-func GitCommit(repoPath, message string) error {
-	cmd := exec.Command("git", "commit", "-m", message)
+// GitPushBranch pushes HEAD to the named branch on origin. The refspec is
+// explicit so the push depends neither on an upstream nor on the checked-out
+// branch. Returns ErrPushRejected when origin moved ahead.
+func GitPushBranch(repoPath, branch string) error {
+	var combined bytes.Buffer
+	cmd := exec.Command("git", "push", "origin", "HEAD:refs/heads/"+branch)
 	cmd.Dir = repoPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git commit fallito in %s: %w", repoPath, err)
+		detail := strings.TrimSpace(combined.String())
+		lower := strings.ToLower(detail)
+		if strings.Contains(lower, "rejected") ||
+			strings.Contains(lower, "non-fast-forward") ||
+			strings.Contains(lower, "fetch first") {
+			return ErrPushRejected
+		}
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("git push su %s fallito: %s", branch, detail)
 	}
 	return nil
 }
 
-// GitPush pushes the current branch to origin.
-func GitPush(repoPath string) error {
-	cmd := exec.Command("git", "push")
+// DeployedService pairs a deployed service with the tag it went out with.
+type DeployedService struct {
+	Name string
+	Tag  string
+}
+
+// deployCommitTrailer marks the commit as coming from hub-cli, so it is
+// recognisable among the ones pushed by hand on the same branch.
+const deployCommitTrailer = "Deploy eseguito con hub-cli."
+
+// DeployCommitMessageFor builds one message for every service deployed in a
+// run: a single commit per workflow means fewer pushes and fewer races.
+func DeployCommitMessageFor(services []DeployedService) string {
+	return DeployCommitMessageAligned(services, nil)
+}
+
+// DeployCommitMessageAligned also names the tags written back as the cluster
+// already ran them: a change to the values nobody deployed in this run, which
+// whoever reads the branch history should not have to reverse-engineer.
+func DeployCommitMessageAligned(services, aligned []DeployedService) string {
+	msg := "chore(deploy): " + joinDeployed(services) + "\n\n"
+	if len(aligned) > 0 {
+		msg += "Allineato a quanto già deployato: " + joinDeployed(aligned) + ".\n\n"
+	}
+	return msg + deployCommitTrailer
+}
+
+func joinDeployed(services []DeployedService) string {
+	parts := make([]string, 0, len(services))
+	for _, svc := range services {
+		parts = append(parts, fmt.Sprintf("%s → %s", svc.Name, svc.Tag))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// GitCurrentBranch returns the checked-out branch of the given repository.
+func GitCurrentBranch(repoPath string) (string, error) {
+	cmd := exec.Command("git", "branch", "--show-current")
 	cmd.Dir = repoPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git push fallito in %s: %w", repoPath, err)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("impossibile leggere il branch di %s: %w", repoPath, err)
 	}
-	return nil
-}
-
-// DeployCommitMessage builds a deploy commit message: "chore(deploy): <service> → <new-tag>".
-func DeployCommitMessage(serviceName, newTag string) string {
-	return fmt.Sprintf("chore(deploy): %s → %s", serviceName, newTag)
+	return strings.TrimSpace(string(out)), nil
 }

@@ -74,6 +74,17 @@ func DockerBuild(ecrRepository, tag, dockerfilePath string, buildArgs map[string
 	return nil
 }
 
+// SplitImageRef splits a full image reference "registry/path:tag" into
+// repository ("registry/path") and tag. Tag is empty when absent; a port in
+// the registry host ("host:5000/path") is not mistaken for a tag.
+func SplitImageRef(image string) (repository, tag string) {
+	idx := strings.LastIndex(image, ":")
+	if idx == -1 || strings.Contains(image[idx:], "/") {
+		return image, ""
+	}
+	return image[:idx], image[idx+1:]
+}
+
 // DockerPush runs `docker push <repo>:<tag>`.
 func DockerPush(ecrRepository, tag string, out io.Writer) error {
 	fullImage := fmt.Sprintf("%s:%s", ecrRepository, tag)

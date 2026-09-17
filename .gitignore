@@ -32,10 +32,6 @@ vendor/
 seed.yaml
 *.seed.yaml
 
-# File deprecato (PSN — codice commentato, contiene riferimenti specifici ambiente)
-cmd/psn.go
-
-
 # OS
 .DS_Store
 Thumbs.db
@@ -47,4 +43,3 @@ docs/TODO.md
 
 #Claude
 /.claude/settings.local.json
-/internal/logic/azure.go

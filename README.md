@@ -18,12 +18,14 @@ Copy the executable to a folder in `PATH`:
 Copy-Item .\hub-cli.exe "$env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\hub-cli.exe"
 ```
 
-On first run, the config file is created at `~/.hub-cli.yaml`.
+On first run, the config file is created at `~/.hub-cli/config.yaml`. Everything hub-cli owns — config, seed and the managed clones — lives under `~/.hub-cli/`.
 
 ## Quick start
 
 ```
-hub-cli                    # run the deploy workflow
+hub-cli                    # pick the environment (Local / PSN) and run the deploy workflow
+hub-cli local              # deploy to the local cluster (ECR + Helm)
+hub-cli psn                # deploy to PSN (Production/Staging Network) environments (Azure AKS + ACR)
 hub-cli config show        # show current configuration
 hub-cli config set-theme   # change the interface theme
 ```
@@ -52,12 +54,14 @@ Copia l'eseguibile in una cartella nel `PATH`:
 Copy-Item .\hub-cli.exe "$env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\hub-cli.exe"
 ```
 
-Al primo avvio il file di configurazione viene creato automaticamente in `~/.hub-cli.yaml`.
+Al primo avvio il file di configurazione viene creato automaticamente in `~/.hub-cli/config.yaml`. Tutto ciò che appartiene a hub-cli — config, seed e cloni gestiti — vive sotto `~/.hub-cli/`.
 
 ## Utilizzo rapido
 
 ```
-hub-cli                    # avvia il workflow di deploy
+hub-cli                    # scegli l'ambiente (Locale / PSN) e avvia il workflow di deploy
+hub-cli local              # deploy sul cluster locale (ECR + Helm)
+hub-cli psn                # deploy sugli ambienti PSN (Production/Staging Network) (Azure AKS + ACR)
 hub-cli config show        # mostra la configurazione corrente
 hub-cli config set-theme   # cambia tema dell'interfaccia
 ```

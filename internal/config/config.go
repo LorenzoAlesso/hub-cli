@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -15,7 +16,7 @@ type SeedStatus int
 
 const (
 	SeedNone     SeedStatus = iota // config already exists; no seeding performed
-	SeedFromFile                   // config created and populated from ~/.hub-cli.seed.yaml
+	SeedFromFile                   // config created and populated from the seed file
 	SeedEmpty                      // config created empty (seed file absent)
 )
 
@@ -27,18 +28,82 @@ func WasSeeded() bool { return freshlySeededStatus != SeedNone }
 // SeededFromFile reports whether first-run loaded services from the seed YAML.
 func SeededFromFile() bool { return freshlySeededStatus == SeedFromFile }
 
+// StateDir is the single directory holding everything hub-cli owns: the user
+// config, the seed and the managed clones.
+func StateDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("impossibile trovare la home directory: %w", err)
+	}
+	return filepath.Join(home, ".hub-cli"), nil
+}
+
+// ConfigFilePath returns the default path of the user config.
+func ConfigFilePath() (string, error) {
+	dir, err := StateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.yaml"), nil
+}
+
 // SeedFilePath returns the expected path of the user's seed file.
 func SeedFilePath() string {
-	home, err := os.UserHomeDir()
+	dir, err := StateDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".hub-cli.seed.yaml")
+	return filepath.Join(dir, "seed.yaml")
+}
+
+var migratedFiles []string
+
+// MigratedFiles lists the files moved into the state directory on this run, so
+// the caller can say what happened instead of leaving the user to notice.
+func MigratedFiles() []string { return migratedFiles }
+
+// migrateLegacyFiles moves config and seed from the scattered dotfiles they used
+// to live in into the state directory. It runs once: after the move the new
+// paths exist and the old ones are gone.
+func migrateLegacyFiles() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir, err := StateDir()
+	if err != nil {
+		return err
+	}
+
+	moves := []struct{ from, to string }{
+		{filepath.Join(home, ".hub-cli.yaml"), filepath.Join(dir, "config.yaml")},
+		{filepath.Join(home, ".hub-cli.seed.yaml"), filepath.Join(dir, "seed.yaml")},
+	}
+
+	for _, m := range moves {
+		if _, err := os.Stat(m.to); err == nil {
+			continue // already in place: never overwrite the current file
+		}
+		if _, err := os.Stat(m.from); err != nil {
+			continue // nothing to move
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("creazione di %s fallita: %w", dir, err)
+		}
+		if err := os.Rename(m.from, m.to); err != nil {
+			return fmt.Errorf("spostamento di %s fallito: %w", m.from, err)
+		}
+		migratedFiles = append(migratedFiles, fmt.Sprintf("%s → %s", m.from, m.to))
+	}
+	return nil
 }
 
 type GlobalConfig struct {
 	DockerRootPath   string `mapstructure:"docker_root_path"`
 	HelmRootPath     string `mapstructure:"helm_root_path"`
+	HelmSyncBranch   string `mapstructure:"helm_sync_branch"`
+	DockerSyncBranch string `mapstructure:"docker_sync_branch"`
+	ReposRoot        string `mapstructure:"repos_root"`
 	ECRRegion        string `mapstructure:"ecr_region"`
 	ECRAccountID     string `mapstructure:"ecr_account_id"`
 	ChartVersion     string `mapstructure:"chart_version"`
@@ -61,20 +126,143 @@ type ServiceConfig struct {
 	K8sImageRef       string `mapstructure:"k8s_image_ref"      yaml:"k8s_image_ref,omitempty"`
 }
 
+// PSNReleaseConfig is one Helm release deployable on a cluster, and a cluster
+// hosts more than one. Nothing is derived: the naming that holds for one chart
+// does not hold for the others in the same repository.
+type PSNReleaseConfig struct {
+	Name         string `mapstructure:"name"          yaml:"name"` // helm release, e.g. app-site-a-coll
+	Namespace    string `mapstructure:"namespace"     yaml:"namespace"`
+	Chart        string `mapstructure:"chart"         yaml:"chart"`         // chart directory in the charts repo, e.g. "app"
+	Values       string `mapstructure:"values"        yaml:"values"`        // values file in the charts repo
+	ChartsBranch string `mapstructure:"charts_branch" yaml:"charts_branch"` // branch the chart and values are read from
+}
+
+// PSNClusterConfig identifies one PSN target environment
+// (Azure subscription + AKS cluster + ACR registry).
+type PSNClusterConfig struct {
+	Name           string             `mapstructure:"name"            yaml:"name"`
+	SubscriptionID string             `mapstructure:"subscription_id" yaml:"subscription_id"`
+	ResourceGroup  string             `mapstructure:"resource_group"  yaml:"resource_group"`
+	AKSName        string             `mapstructure:"aks_name"        yaml:"aks_name"`
+	ACRName        string             `mapstructure:"acr_name"        yaml:"acr_name"`
+	Env            string             `mapstructure:"env"             yaml:"env"` // coll | prod
+	Releases       []PSNReleaseConfig `mapstructure:"releases"        yaml:"releases"`
+}
+
+// IsProd reports whether the cluster is a production environment.
+func (c PSNClusterConfig) IsProd() bool {
+	env := strings.ToLower(strings.TrimSpace(c.Env))
+	return env == "prod" || env == "produzione" || env == "production"
+}
+
+// PSNProjectConfig overrides Dockerfile resolution for the namespaces matching
+// Namespace (glob, e.g. "app-*"): builds use DockerRoot instead of the global
+// docker_root_path. BranchColl/BranchProd are the git branches to build from on
+// collaudo/produzione clusters — when set, builds run from a managed clone
+// aligned to that branch, because the branch determines the image contents.
+type PSNProjectConfig struct {
+	Namespace   string            `mapstructure:"namespace"   yaml:"namespace"`
+	DockerRoot  string            `mapstructure:"docker_root" yaml:"docker_root"`
+	BranchColl  string            `mapstructure:"branch_coll" yaml:"branch_coll"`
+	BranchProd  string            `mapstructure:"branch_prod" yaml:"branch_prod"`
+	Deployments map[string]string `mapstructure:"deployments" yaml:"deployments"` // deployment → Dockerfile path relative to docker_root
+}
+
+// ExpectedBranch returns the git branch DockerRoot should be on for the given
+// cluster, or "" when no branch constraint applies.
+func (p PSNProjectConfig) ExpectedBranch(cluster PSNClusterConfig) string {
+	if cluster.IsProd() {
+		return p.BranchProd
+	}
+	return p.BranchColl
+}
+
+// PSNConfig is the PSN (Azure) deploy configuration: target clusters plus the
+// deployment → local service mapping used to resolve Dockerfiles for builds.
+// Namespaces, deployments, ACR repository paths and current tags are all
+// discovered live from the selected cluster, so they are not configured here.
+type PSNConfig struct {
+	TenantID    string             `mapstructure:"tenant_id"`
+	Clusters    []PSNClusterConfig `mapstructure:"clusters"`
+	Deployments map[string]string  `mapstructure:"deployments"`
+	Projects    []PSNProjectConfig `mapstructure:"projects"`
+}
+
+// ProjectForNamespace returns the first project whose pattern matches ns,
+// or nil when the namespace uses the default resolution.
+func (p PSNConfig) ProjectForNamespace(ns string) *PSNProjectConfig {
+	for i, proj := range p.Projects {
+		if proj.Namespace == "" {
+			continue
+		}
+		if ok, err := path.Match(proj.Namespace, ns); err == nil && ok {
+			return &p.Projects[i]
+		}
+		if proj.Namespace == ns {
+			return &p.Projects[i]
+		}
+	}
+	return nil
+}
+
+// Validate checks that the PSN block is present and complete enough to run a deploy.
+func (p PSNConfig) Validate() error {
+	if len(p.Clusters) == 0 {
+		return fmt.Errorf("nessun cluster nel blocco psn")
+	}
+	if p.TenantID == "" {
+		return fmt.Errorf("tenant_id mancante nel blocco psn")
+	}
+	for i, c := range p.Clusters {
+		var missing []string
+		if c.Name == "" {
+			missing = append(missing, "name")
+		}
+		if c.SubscriptionID == "" {
+			missing = append(missing, "subscription_id")
+		}
+		if c.ResourceGroup == "" {
+			missing = append(missing, "resource_group")
+		}
+		if c.AKSName == "" {
+			missing = append(missing, "aks_name")
+		}
+		if c.ACRName == "" {
+			missing = append(missing, "acr_name")
+		}
+		if len(missing) > 0 {
+			label := c.Name
+			if label == "" {
+				label = fmt.Sprintf("#%d", i+1)
+			}
+			return fmt.Errorf("cluster %s: campi mancanti: %s", label, strings.Join(missing, ", "))
+		}
+	}
+	return nil
+}
+
 type Config struct {
 	Config   GlobalConfig             `mapstructure:"config"`
 	Services map[string]ServiceConfig `mapstructure:"services"`
+	PSN      PSNConfig                `mapstructure:"psn"`
 }
 
 func Init(customPath string) error {
+	if err := migrateLegacyFiles(); err != nil {
+		return err
+	}
+
 	if customPath != "" {
 		viper.SetConfigFile(customPath)
 	} else {
-		home, err := os.UserHomeDir()
+		path, err := ConfigFilePath()
 		if err != nil {
-			return fmt.Errorf("impossibile trovare la home directory: %w", err)
+			return err
 		}
-		viper.SetConfigFile(filepath.Join(home, ".hub-cli.yaml"))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("creazione della cartella di configurazione fallita: %w", err)
+		}
+		viper.SetConfigFile(path)
 	}
 
 	viper.SetDefault("config.ecr_region", "eu-west-1")
@@ -110,7 +298,11 @@ func Init(customPath string) error {
 	if err != nil {
 		return err
 	}
-	if added {
+	psnAdded, err := ensureMissingPSNBlock()
+	if err != nil {
+		return err
+	}
+	if added || psnAdded {
 		if err := viper.WriteConfig(); err != nil {
 			return err
 		}
@@ -122,9 +314,10 @@ func Init(customPath string) error {
 type seedFile struct {
 	Config   map[string]any            `yaml:"config"`
 	Services map[string]map[string]any `yaml:"services"`
+	PSN      map[string]any            `yaml:"psn"`
 }
 
-// loadSeedFromFile reads ~/.hub-cli.seed.yaml. Missing file is a valid state
+// loadSeedFromFile reads the seed file. A missing file is a valid state
 // and returns (nil, nil); a malformed file returns an error.
 func loadSeedFromFile() (*seedFile, error) {
 	path := SeedFilePath()
@@ -164,7 +357,36 @@ func seedDefaultServices() (bool, error) {
 			viper.Set(fmt.Sprintf("services.%s.%s", name, key), val)
 		}
 	}
+	if len(seed.PSN) > 0 {
+		viper.Set("psn", seed.PSN)
+	}
 	return len(seed.Services) > 0, nil
+}
+
+// ensureMissingPSNBlock imports the seed's psn block when the config has none,
+// and fills in any top-level psn key (tenant_id, clusters, deployments,
+// projects, ...) the config is still missing. Existing keys are never touched.
+// Returns (true, nil) if anything was imported.
+func ensureMissingPSNBlock() (bool, error) {
+	seed, err := loadSeedFromFile()
+	if err != nil {
+		return false, err
+	}
+	if seed == nil || len(seed.PSN) == 0 {
+		return false, nil
+	}
+	if !viper.IsSet("psn") {
+		viper.Set("psn", seed.PSN)
+		return true, nil
+	}
+	added := false
+	for key, val := range seed.PSN {
+		if !viper.IsSet("psn." + key) {
+			viper.Set("psn."+key, val)
+			added = true
+		}
+	}
+	return added, nil
 }
 
 // sanitizeServiceKeysInFile strips service keys containing control characters
@@ -395,4 +617,34 @@ func GetDockerRootPath() string {
 
 func GetHelmRootPath() string {
 	return viper.GetString("config.helm_root_path")
+}
+
+// GetHelmSyncBranch returns the chart branch used by the last run, empty when
+// there is none: the right branch depends on the site being worked on, so it is
+// chosen per run and this value only preselects the picker.
+func GetHelmSyncBranch() string {
+	return strings.TrimSpace(viper.GetString("config.helm_sync_branch"))
+}
+
+// SetHelmSyncBranch remembers the branch chosen in this run.
+func SetHelmSyncBranch(branch string) error {
+	viper.Set("config.helm_sync_branch", branch)
+	return Save()
+}
+
+// GetDockerBranch returns the Docker branch used by the last run, empty when
+// there is none: like the chart branch it is chosen per run and this value only
+// preselects the picker.
+func GetDockerBranch() string {
+	return strings.TrimSpace(viper.GetString("config.docker_sync_branch"))
+}
+
+// SetDockerBranch remembers the Docker branch chosen in this run.
+func SetDockerBranch(branch string) error {
+	viper.Set("config.docker_sync_branch", branch)
+	return Save()
+}
+
+func GetReposRoot() string {
+	return viper.GetString("config.repos_root")
 }

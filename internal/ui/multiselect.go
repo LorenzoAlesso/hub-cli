@@ -78,20 +78,19 @@ func (m multiSelectModel) View() tea.View {
 
 	maxLen := 0
 	for _, item := range m.items {
-		if len(item.Label) > maxLen {
-			maxLen = len(item.Label)
+		if w := lipgloss.Width(item.Label); w > maxLen {
+			maxLen = w
 		}
 	}
 
 	var sb strings.Builder
-	sb.WriteString(TitleStyle.Render(m.title) + "\n\n")
 
 	lines := make([]string, len(m.items))
 	for i, item := range m.items {
-		padding := strings.Repeat(" ", maxLen-len(item.Label)+2)
+		padding := strings.Repeat(" ", maxLen-lipgloss.Width(item.Label)+2)
 		var desc string
 		if item.Desc != "" {
-			desc = lipgloss.NewStyle().Foreground(Muted).Render("· " + item.Desc)
+			desc = DimStyle.Render(item.Desc)
 		}
 
 		cur := " "
@@ -109,29 +108,19 @@ func (m multiSelectModel) View() tea.View {
 			label = SelectedItemStyle.Render(item.Label)
 		}
 
-		lines[i] = fmt.Sprintf("  %s %s %s%s%s", cur, dot, label, padding, desc)
+		lines[i] = fmt.Sprintf("%s %s %s%s%s", cur, dot, label, padding, desc)
 	}
 
-	// Normalize all line widths so the box border never shifts on hover.
-	maxWidth := 0
-	for _, line := range lines {
-		if w := lipgloss.Width(line); w > maxWidth {
-			maxWidth = w
-		}
-	}
-	for i, line := range lines {
-		if w := lipgloss.Width(line); w < maxWidth {
-			lines[i] = line + strings.Repeat(" ", maxWidth-w)
-		}
-	}
-
-	sb.WriteString(BoxStyle.Render(strings.Join(lines, "\n")))
+	sb.WriteString(questionBox(SelectedItemStyle.Render(m.title), CursorStyle, lines))
 
 	count := len(m.selected)
 	hint := HelpStyle.Render("↑/↓ naviga · i seleziona · a tutto · enter conferma · esc annulla")
 	if count > 0 {
-		countStr := SuccessStyle.Render(fmt.Sprintf("  %d selezionati", count))
-		sb.WriteString("\n" + hint + countStr)
+		label := "selezionati"
+		if count == 1 {
+			label = "selezionato"
+		}
+		sb.WriteString("\n" + hint + SuccessStyle.Render(fmt.Sprintf("  %d %s", count, label)))
 	} else {
 		sb.WriteString("\n" + hint)
 	}

@@ -1,19 +1,19 @@
 # Template seed.yaml per hub-cli.
 #
 # Uso:
-#   1. Copia questo file in ~/.hub-cli.seed.yaml
+#   1. Copia questo file in ~/.hub-cli/seed.yaml
 #   2. Personalizza i valori per i tuoi servizi
 #   3. Rilancia un qualsiasi comando hub-cli per importarli nel config utente
 #
-# NOTA: il file ~/.hub-cli.seed.yaml NON va committato — contiene dati
+# NOTA: il file ~/.hub-cli/seed.yaml NON va committato — contiene dati
 # specifici dell'ambiente (registry, namespace, release name, ecc.).
 #
-# Formato: stessa struttura di ~/.hub-cli.yaml (sezioni `config` e `services`).
+# Formato: stessa struttura di ~/.hub-cli/config.yaml (sezioni `config` e `services`).
 # Ogni servizio ha campi obbligatori (ecr_repository, helm_set_key)
 # e campi opzionali documentati di seguito.
 
 # ── Configurazione globale (opzionale) ──────────────────────────────────
-# Applicata solo al primo avvio, quando ~/.hub-cli.yaml non esiste ancora.
+# Applicata solo al primo avvio, quando ~/.hub-cli/config.yaml non esiste ancora.
 # Se una chiave è assente, vale il default interno.
 config:
   # Account ID AWS del registry ECR (12 cifre)
@@ -29,6 +29,26 @@ config:
   # Contesto kubectl del cluster locale. Se assente, al primo deploy/refresh
   # viene chiesto interattivamente. Impostalo qui per saltare il prompt.
   # local_kube_context: kubernetes-admin@kubernetes
+
+  # ── Repo gestiti ──────────────────────────────────────────────────────
+  # hub-cli mantiene cloni propri dei repo (charts e Docker) e li riallinea a
+  # origin a ogni esecuzione. Serve perché le copie di lavoro sono condivise
+  # con lo sviluppo quotidiano: cambio di branch, modifiche non committate,
+  # e soprattutto push fatti da altre persone senza passare da hub-cli.
+  #
+  # Da questi cloni vengono letti il values passato a `helm -f` e, su PSN,
+  # i Dockerfile della build. Gli URL non si configurano: si ricavano dal
+  # remote origin di helm_root_path / docker_root_path.
+
+  # Ultimo branch chart usato. Il branch viene chiesto a ogni run, leggendo
+  # quelli pubblicati sul remote: questo valore serve solo a preselezionarlo.
+  # helm_sync_branch: dev
+
+  # Branch del repo Docker per il sync di k8s_manifest_path. Default: master.
+  # docker_sync_branch: master
+
+  # Cartella che ospita i cloni gestiti. Default: ~/.hub-cli/repos
+  # repos_root: ""
 
 services:
   my-service:
@@ -74,3 +94,59 @@ services:
     # Stringa da cercare nel manifest k8s per individuare l'immagine
     # da aggiornare (tipicamente "<org>/<service>").
     # k8s_image_ref: my-org/my-service
+
+# ── Deploy PSN (Azure AKS + ACR) — opzionale ────────────────────────────
+# Configurazione per `hub-cli psn`. Il deploy è Helm: servizi, repository ACR
+# e tag correnti vengono letti dal values del release, non dal cluster. Qui
+# servono i cluster target, i rilasci deployabili su ciascuno, e il mapping
+# deployment → servizio locale usato per risolvere i Dockerfile della build.
+# psn:
+#   # Tenant Azure (richiesto da `az login`)
+#   tenant_id: "00000000-0000-0000-0000-000000000000"
+#
+#   # Un cluster per ambiente. env: coll | prod — gli ambienti prod
+#   # richiedono una conferma extra (digitazione del nome) prima del deploy.
+#   clusters:
+#     - name: "MYENV — Collaudo"
+#       subscription_id: "00000000-0000-0000-0000-000000000000"
+#       resource_group: RG-My-Env-AKS
+#       aks_name: myaksname001
+#       acr_name: myacrname001
+#       env: coll
+#
+#       # I rilasci Helm deployabili su questo cluster. Sono una lista: un
+#       # cluster ne ospita più d'uno (l'applicativo, vault, ...).
+#       #
+#       # Niente viene dedotto: la convenzione di naming di un chart non vale
+#       # per gli altri dello stesso repo, quindi release, values e branch si
+#       # dichiarano. Chart e values vengono letti dal clone gestito del repo
+#       # dei chart (l'URL si ricava da helm_root_path) sul branch indicato:
+#       # lo stesso values differisce da branch a branch.
+#       releases:
+#         - name: myapp-myenv-coll        # nome del release Helm
+#           namespace: myapp-col
+#           chart: myapp                  # cartella del chart nel repo
+#           values: myapp/values-myenv-coll.yaml
+#           charts_branch: dev-myenv
+#
+#   # Mapping deployment (nome sul cluster PSN) → servizio locale: la build
+#   # riusa dockerfile_subpath del servizio indicato. I deployment senza
+#   # mapping ricadono sulla ricerca automatica dei Dockerfile.
+#   deployments:
+#     webapp: my-service
+#
+#   # Progetti Docker dedicati per-namespace (opzionale): nei namespace che
+#   # matchano il pattern, i Dockerfile si risolvono dentro docker_root
+#   # (mapping esplicito → convenzione <deployment>/Dockerfile → scansione)
+#   # invece che nel docker_root_path globale. branch_coll/branch_prod:
+#   # branch da cui buildare per quell'ambiente — il clone gestito ci viene
+#   # allineato prima della build, senza toccare la tua copia di lavoro. Se il
+#   # branch dichiarato non esiste più sul remote, vengono proposti quelli
+#   # disponibili invece di interrompere il deploy.
+#   projects:
+#     - namespace: "legacy-*"
+#       docker_root: C:/dev/legacy-project/docker-images
+#       branch_coll: develop
+#       branch_prod: main
+#       deployments:
+#         api: api/custom/Dockerfile   # override del path convenzionale

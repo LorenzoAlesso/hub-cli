@@ -2,9 +2,11 @@ package ui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -20,17 +22,29 @@ type wfState int
 
 const (
 	wfECRLogin wfState = iota
+	wfBranchLoading
+	wfBranchSelect
+	wfRepoPrep
+	wfDockerBranchLoading
+	wfDockerBranchSelect
+	wfDockerRepoPrep
 	wfServiceSelect
 	wfSvcTagSync
 	wfSvcDockerfile
+	wfSvcDockerfileMissing
+	wfSvcDockerBranchSelect
+	wfSvcDockerBranchSwitch
 	wfSvcTagInput
 	wfSvcBuildArg
 	wfSvcBuilding
 	wfSvcPushing
+	wfSvcPushError
 	wfSvcHelm
 	wfSvcHelmError
 	wfSvcRollback
-	wfSvcPostSync
+	wfSvcRestartConfirm
+	wfSvcRestarting
+	wfPostSync // once per workflow, not once per service
 	wfSummary
 )
 
@@ -41,7 +55,35 @@ type wfOpDoneMsg struct {
 	output []byte
 }
 
+type wfBranchesLoadedMsg struct {
+	branches []string
+	err      error
+}
+
+type wfDockerBranchesLoadedMsg struct {
+	branches []string
+	err      error
+}
+
+type wfDockerRepoPrepDoneMsg struct {
+	dir string
+	err error
+}
+
+// wfDockerSwitchDoneMsg reports the Docker clone moved to another branch in the
+// middle of a service, after its Dockerfile was not found on the first one.
+type wfDockerSwitchDoneMsg struct {
+	dir string
+	err error
+}
+
+type wfRepoPrepDoneMsg struct {
+	dir string
+	err error
+}
+
 type wfPostSyncDoneMsg struct {
+	err   error
 	lines []string
 }
 
@@ -80,38 +122,118 @@ type WorkflowModel struct {
 	buildArgQueue  []logic.DockerArg
 	buildArgIdx    int
 	svcStart       time.Time
+	pushAttempt    int // attempt of the push in flight, counted from 1
 	helmSetArg     string
 	valuesPath     string
 	chartVersion   string
 
+	localSources  bool              // values and Dockerfile from the working copies: test deploy, sync skipped
+	helmRemoteURL string            // origin of the charts repo, read from the working copy
+	helmBranch    string            // chart branch chosen for this run
+	helmRepoDir   string            // managed clone the values are read from, "" = working copy
+	dockerURL     string            // origin of the Docker repo, read from the working copy
+	dockerBranch  string            // Docker branch chosen for this run
+	dockerRepoDir string            // managed clone the build reads from, "" = working copy
+	deployed      []deployedService // services that reached the cluster, for the final commit
+	syncErr       error
+	restartTarget string // Deployment to restart when the tag did not change
+	restarted     bool   // the service in hand had its pod recreated
+	svcLogStart   int    // where the header of the service in hand sits in the log
+
+	// dockerBranchChoices and dockerfileBranches are read when a Dockerfile is
+	// missing: every branch of origin, and the ones that have this Dockerfile.
+	dockerBranchChoices []string
+	dockerfileBranches  []string
+	switchBranch        string // branch the Docker clone is being moved to
+
 	results []DeployResult
 }
 
+// deployedService remembers what a finished service needs for the final sync.
+type deployedService struct {
+	dockerBranch string // branch of the Docker repo the image was built from
+	name         string
+	tag          string
+	svc          config.ServiceConfig
+}
+
 // RunWorkflow runs the full deploy pipeline as a single persistent BubbleTea program.
-// Returns (results, cancelled, error).
-func RunWorkflow(cfg *config.Config, dryRun, testUI bool) ([]DeployResult, bool, error) {
+// Returns (results, cancelled, syncErr, error): syncErr is not fatal, the deploy
+// already reached the cluster, but the repository no longer reflects it.
+func RunWorkflow(cfg *config.Config, dryRun, testUI, localSources bool) ([]DeployResult, bool, error, error) {
 	label := "LOCAL DEPLOY"
-	if testUI {
+	switch {
+	case testUI:
 		label = "TEST-UI"
+	case localSources:
+		label = "LOCAL DEPLOY (prova)"
 	}
 	SetStatus(label, cfg.Config.ECRRegion)
 
 	m := WorkflowModel{
-		cfg:     cfg,
-		dryRun:  dryRun,
-		testUI:  testUI,
-		state:   wfECRLogin,
-		spinner: newSpinnerModel("ECR Login"),
-		opStart: time.Now(),
+		cfg:          cfg,
+		dryRun:       dryRun,
+		testUI:       testUI,
+		localSources: localSources,
+		state:        wfECRLogin,
+		spinner:      newSpinnerModel("ECR Login"),
+		opStart:      time.Now(),
 	}
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	ClearStatus()
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	wf := final.(WorkflowModel)
-	return wf.results, wf.cancelled, nil
+	SetSummaryContext("Locale  ·  "+cfg.Config.ECRRegion, wf.summaryFooter())
+	return wf.results, wf.cancelled, wf.syncErr, nil
+}
+
+// summaryFooter is the line under the closing table: one upgrade per service
+// here, unlike PSN, and where the tags were written back.
+func (m WorkflowModel) summaryFooter() string {
+	label := "servizi"
+	if len(m.results) == 1 {
+		label = "servizio"
+	}
+	parts := []string{fmt.Sprintf("%d %s", len(m.results), label)}
+	if n := len(m.deployed); n > 0 {
+		revisions := "revisioni helm"
+		if n == 1 {
+			revisions = "revisione helm"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", n, revisions))
+	}
+	switch {
+	case m.localSources:
+		parts = append(parts, "sync saltato")
+	case m.syncErr != nil:
+		parts = append(parts, "sync non riuscito")
+	case len(m.deployed) > 0 && m.helmBranch != "" && !m.dryRun && !m.testUI:
+		parts = append(parts, "values su "+m.helmBranch)
+	}
+	return strings.Join(parts, "  ·  ")
+}
+
+// helmValuesRoot is the directory the values file is read from: the managed
+// clone, or the working copy under --local-sources.
+func (m WorkflowModel) helmValuesRoot() string {
+	if m.helmRepoDir != "" {
+		return m.helmRepoDir
+	}
+	return m.cfg.Config.HelmRootPath
+}
+
+// dockerBuildRoot is the directory the build reads Dockerfiles from. Like the
+// chart repo, the Docker repo carries one branch per site and environment, so
+// what gets baked into the image depends on the branch — not on how the working
+// copy happens to be left.
+func (m WorkflowModel) dockerBuildRoot() string {
+	if m.dockerRepoDir != "" {
+		return m.dockerRepoDir
+	}
+	return m.cfg.Config.DockerRootPath
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -147,23 +269,66 @@ func (m WorkflowModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if done, ok := msg.(wfOpDoneMsg); ok {
 		return m.handleOpDone(done)
 	}
+	if bl, ok := msg.(wfBranchesLoadedMsg); ok {
+		if bl.err != nil {
+			m.log = append(m.log, ErrStyle.Render("  ✗  "+bl.err.Error()))
+			m.log = append(m.log, DimStyle.Render(
+				"      Per usare le copie di lavoro: hub-cli local --local-sources"))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		return m.enterBranchSelect(bl.branches)
+	}
+	if rp, ok := msg.(wfRepoPrepDoneMsg); ok {
+		if rp.err != nil {
+			// A stale or wrong-branch values file would silently revert
+			// somebody else's change on the cluster.
+			m.log = append(m.log, ErrStyle.Render("  ✗  Allineamento del repo charts non riuscito: "+rp.err.Error()))
+			m.log = append(m.log, DimStyle.Render(
+				"      Per usare le copie di lavoro: hub-cli local --local-sources"))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		m.helmRepoDir = rp.dir
+		m.log = append(m.log, logDone("Values", "origin/"+m.helmBranch,
+			formatElapsed(time.Since(m.opStart))))
+		return m.enterDockerBranchLoading()
+	}
+	if bl, ok := msg.(wfDockerBranchesLoadedMsg); ok {
+		if bl.err != nil {
+			m.log = append(m.log, ErrStyle.Render("  ✗  "+bl.err.Error()))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		return m.enterDockerBranchSelect(bl.branches)
+	}
+	if rp, ok := msg.(wfDockerRepoPrepDoneMsg); ok {
+		if rp.err != nil {
+			m.log = append(m.log, ErrStyle.Render(
+				"  ✗  Allineamento del repo Docker non riuscito: "+rp.err.Error()))
+			m.cancelled = true
+			return m, tea.Quit
+		}
+		m.dockerRepoDir = rp.dir
+		m.log = append(m.log, logDone("Dockerfile", "origin/"+m.dockerBranch,
+			formatElapsed(time.Since(m.opStart))))
+		return m.enterServiceSelect()
+	}
+	if sw, ok := msg.(wfDockerSwitchDoneMsg); ok {
+		return m.handleDockerSwitchDone(sw)
+	}
 	if ps, ok := msg.(wfPostSyncDoneMsg); ok {
 		m.log = append(m.log, ps.lines...)
-		m.results = append(m.results, DeployResult{
-			Service: m.svcName,
-			OldTag:  m.oldTag,
-			NewTag:  m.newTag,
-			Elapsed: time.Since(m.svcStart),
-		})
-		m.svcIdx++
-		return m.startNextService()
+		m.syncErr = ps.err
+		return m.enterSummary()
 	}
 	return m.forwardToActive(msg)
 }
 
 func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcPostSync:
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting, wfSvcDockerBranchSwitch,
+		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
 		sm, cmd := m.spinner.Update(msg)
 		m.spinner = sm.(spinnerModel)
 		return m, cmd
@@ -192,16 +357,35 @@ func (m WorkflowModel) forwardToActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case wfSvcDockerfile, wfSvcHelmError:
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcPushError,
+		wfSvcHelmError, wfSvcRestartConfirm:
 		sm, cmd := m.list.Update(msg)
 		m.list = sm.(listModel)
+		if m.list.quit && m.state == wfSvcDockerBranchSelect {
+			// Backing out of the branch list returns to the question it came
+			// from, instead of abandoning the whole run.
+			return m.enterDockerfileMissing()
+		}
 		if m.list.quit {
 			m.cancelled = true
 			return m, tea.Quit
 		}
 		if m.list.done {
-			if m.state == wfSvcDockerfile {
+			switch m.state {
+			case wfBranchSelect:
+				return m.finishBranchSelect()
+			case wfDockerBranchSelect:
+				return m.finishDockerBranchSelect()
+			case wfSvcDockerfile:
 				return m.finishDockerfile()
+			case wfSvcDockerfileMissing:
+				return m.finishDockerfileMissing()
+			case wfSvcDockerBranchSelect:
+				return m.finishDockerBranchSwitchSelect()
+			case wfSvcRestartConfirm:
+				return m.finishRestartPrompt()
+			case wfSvcPushError:
+				return m.finishPushError()
 			}
 			return m.finishHelmError()
 		}
@@ -233,27 +417,38 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		switch m.state {
 		case wfECRLogin:
-			m.log = append(m.log, ErrStyle.Render("  ✗  ECR Login — "+msg.err.Error()))
-			if len(msg.output) > 0 {
-				m.log = append(m.log, DimStyle.Render(string(msg.output)))
-			}
+			m.log = append(m.log, logFailure("ECR Login", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case wfSvcBuilding:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Docker Build fallito"))
-			if len(msg.output) > 0 {
-				m.log = append(m.log, DimStyle.Render(string(msg.output)))
-			}
+			m.log = append(m.log, logFailure("Build", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m, tea.Quit
 		case wfSvcPushing:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Docker Push fallito"))
-			return m, tea.Quit
+			// A refused or dropped push usually goes through a moment later, so
+			// it is repeated before anything is asked.
+			if m.pushAttempt < pushAttempts {
+				m.log = append(m.log, logPushRetry(m.pushAttempt, msg.err, msg.output, elapsed)...)
+				return m.enterPushAttempt(m.pushAttempt + 1)
+			}
+			m.log = append(m.log, logPushFailure(m.pushAttempt, msg.err, msg.output, elapsed)...)
+			return m.enterPushError()
 		case wfSvcHelm:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Helm Upgrade fallito: "+msg.err.Error()))
+			m.log = append(m.log, logFailure("helm upgrade", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
 			return m.enterHelmError()
 		case wfSvcRollback:
-			m.log = append(m.log, ErrStyle.Render("  ✗  Rollback fallito: "+msg.err.Error()))
+			m.log = append(m.log, logFailure("Rollback", msg.err, elapsed)...)
 			m.cancelled = true
 			return m, tea.Quit
+		case wfSvcRestarting:
+			// The upgrade already landed, so the service counts as deployed:
+			// only the restart failed.
+			m.log = append(m.log, logFailure("Riavvio", msg.err, elapsed)...)
+			m.log = appendOutput(m.log, msg.output)
+			m.log = append(m.log, logWarn(
+				"Il pod potrebbe girare ancora l'immagine precedente: verificare sul cluster.")...)
+			return m.finishService()
 		}
 	}
 
@@ -264,30 +459,216 @@ func (m WorkflowModel) handleOpDone(msg wfOpDoneMsg) (tea.Model, tea.Cmd) {
 				"aws ecr get-login-password --region %s | docker login --username AWS %s.dkr.ecr.%s.amazonaws.com",
 				m.cfg.Config.ECRRegion, m.cfg.Config.ECRAccountID, m.cfg.Config.ECRRegion)))
 		}
-		return m.enterServiceSelect()
+		return m.enterBranchLoading()
 
 	case wfSvcBuilding:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Build  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logDone("Build", "", elapsed))
 		return m.enterPush()
 
 	case wfSvcPushing:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Push  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logDone("Push", pushNote(m.pushAttempt), elapsed))
 		return m.enterHelm()
 
 	case wfSvcHelm:
-		m.log = append(m.log, SuccessStyle.Render("  ✓")+DimStyle.Render("  Deploy  ")+ValueStyle.Render(elapsed))
+		m.log = append(m.log, logDone("helm upgrade", m.svc.ReleaseName, elapsed))
 		// Save tag synchronously (fast file write)
 		if err := config.UpdateServiceTag(m.svcName, m.newTag); err != nil {
 			m.log = append(m.log, WarnStyle.Render("  ⚠  impossibile aggiornare last_tag: "+err.Error()))
 		}
-		return m.enterPostSync()
+		m.deployed = append(m.deployed, deployedService{name: m.svcName, tag: m.newTag, svc: m.svc, dockerBranch: m.dockerBranch})
+		return m.enterRestartPrompt()
 
 	case wfSvcRollback:
 		m.log = append(m.log, WarnStyle.Render("  ⚠  Rollback completato"))
 		m.cancelled = true
 		return m, tea.Quit
+
+	case wfSvcRestarting:
+		m.log = append(m.log, logStep("↻", CursorStyle, "Riavvio "+m.restartTarget, "tag invariato", elapsed))
+		m.markRestarted()
+		return m.finishService()
 	}
 	return m, nil
+}
+
+// ── Chart branch and managed repo prep ────────────────────────────────────────
+
+// enterBranchLoading reads the branches published on the charts remote. Which
+// one holds the right values depends on the site being worked on, so it is a
+// per-run choice rather than a setting.
+func (m WorkflowModel) enterBranchLoading() (tea.Model, tea.Cmd) {
+	helmRoot := m.cfg.Config.HelmRootPath
+
+	switch {
+	case m.localSources:
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Deploy di prova: values e Dockerfile dalle copie di lavoro, sync disattivato"))
+		return m.enterServiceSelect()
+	case m.dryRun || m.testUI:
+		if m.dryRun {
+			m.log = append(m.log, wfDryRunLine("selezione del branch chart e allineamento del repo gestito"))
+		}
+		return m.enterServiceSelect()
+	case helmRoot == "":
+		return m.enterServiceSelect()
+	}
+
+	remoteURL, err := logic.GitRemoteURL(helmRoot)
+	if err != nil {
+		return m, func() tea.Msg { return wfBranchesLoadedMsg{err: err} }
+	}
+	m.helmRemoteURL = remoteURL
+
+	m.state = wfBranchLoading
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Lettura branch dei chart")
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		branches, err := logic.ListRemoteBranches(remoteURL)
+		return wfBranchesLoadedMsg{branches: branches, err: err}
+	})
+}
+
+// enterBranchSelect asks which branch the values come from, preselecting the one
+// used last so the common case stays a single Enter.
+func (m WorkflowModel) enterBranchSelect(branches []string) (tea.Model, tea.Cmd) {
+	if len(branches) == 0 {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Nessun branch pubblicato su "+m.helmRemoteURL))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	if len(branches) == 1 {
+		return m.enterRepoPrep(branches[0])
+	}
+
+	workingCopy, _ := logic.GitCurrentBranch(m.cfg.Config.HelmRootPath)
+	items := make([]Item, len(branches))
+	for i, b := range branches {
+		items[i] = Item{Value: b, Label: b}
+		if b == workingCopy {
+			items[i].Desc = "branch della copia di lavoro"
+		}
+	}
+
+	m.state = wfBranchSelect
+	m.list = listModel{
+		title:  "Branch dei chart da cui leggere i values",
+		items:  items,
+		cursor: wfDefaultBranchIndex(branches, config.GetHelmSyncBranch(), workingCopy),
+		width:  m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishBranchSelect() (tea.Model, tea.Cmd) {
+	return m.enterRepoPrep(m.list.selected)
+}
+
+// wfDefaultBranchIndex preselects the branch used last, falling back to the one
+// the working copy is on.
+func wfDefaultBranchIndex(branches []string, lastUsed, workingCopy string) int {
+	for _, want := range []string{lastUsed, workingCopy} {
+		if want == "" {
+			continue
+		}
+		for i, b := range branches {
+			if b == want {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+// enterRepoPrep realigns the managed clone to the chosen branch before anything
+// is deployed: the values file passed to `helm -f` is applied to the cluster, so
+// it must come from a known, freshly fetched state.
+func (m WorkflowModel) enterRepoPrep(branch string) (tea.Model, tea.Cmd) {
+	m.helmBranch = branch
+	if err := config.SetHelmSyncBranch(branch); err != nil {
+		m.log = append(m.log, WarnStyle.Render("  ⚠  Branch scelto non salvato: "+err.Error()))
+	}
+
+	m.state = wfRepoPrep
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Allineamento repo chart (" + branch + ")")
+	remoteURL := m.helmRemoteURL
+	reposRoot := config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
+		return wfRepoPrepDoneMsg{dir: dir, err: err}
+	})
+}
+
+// enterDockerBranchLoading reads the branches published on the Docker remote.
+func (m WorkflowModel) enterDockerBranchLoading() (tea.Model, tea.Cmd) {
+	dockerRoot := m.cfg.Config.DockerRootPath
+	if m.localSources || m.dryRun || m.testUI || dockerRoot == "" {
+		return m.enterServiceSelect()
+	}
+
+	remoteURL, err := logic.GitRemoteURL(dockerRoot)
+	if err != nil {
+		return m, func() tea.Msg { return wfDockerBranchesLoadedMsg{err: err} }
+	}
+	m.dockerURL = remoteURL
+
+	m.state = wfDockerBranchLoading
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Lettura branch del repo Docker")
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		branches, err := logic.ListRemoteBranches(remoteURL)
+		return wfDockerBranchesLoadedMsg{branches: branches, err: err}
+	})
+}
+
+func (m WorkflowModel) enterDockerBranchSelect(branches []string) (tea.Model, tea.Cmd) {
+	if len(branches) == 0 {
+		m.log = append(m.log, ErrStyle.Render("  ✗  Nessun branch pubblicato su "+m.dockerURL))
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	if len(branches) == 1 {
+		return m.enterDockerRepoPrep(branches[0])
+	}
+
+	workingCopy, _ := logic.GitCurrentBranch(m.cfg.Config.DockerRootPath)
+	items := make([]Item, len(branches))
+	for i, b := range branches {
+		items[i] = Item{Value: b, Label: b}
+		if b == workingCopy {
+			items[i].Desc = "branch della copia di lavoro"
+		}
+	}
+
+	m.state = wfDockerBranchSelect
+	m.list = listModel{
+		title:  "Branch del repo Docker da cui buildare",
+		items:  items,
+		cursor: wfDefaultBranchIndex(branches, config.GetDockerBranch(), workingCopy),
+		width:  m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishDockerBranchSelect() (tea.Model, tea.Cmd) {
+	return m.enterDockerRepoPrep(m.list.selected)
+}
+
+func (m WorkflowModel) enterDockerRepoPrep(branch string) (tea.Model, tea.Cmd) {
+	m.dockerBranch = branch
+	if err := config.SetDockerBranch(branch); err != nil {
+		m.log = append(m.log, WarnStyle.Render("  ⚠  Branch Docker scelto non salvato: "+err.Error()))
+	}
+
+	m.state = wfDockerRepoPrep
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Allineamento repo Docker (" + branch + ")")
+	remoteURL := m.dockerURL
+	reposRoot := config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
+		return wfDockerRepoPrepDoneMsg{dir: dir, err: err}
+	})
 }
 
 // ── enterServiceSelect ────────────────────────────────────────────────────────
@@ -324,7 +705,7 @@ func (m WorkflowModel) finishServiceSelect() (tea.Model, tea.Cmd) {
 
 func (m WorkflowModel) startNextService() (tea.Model, tea.Cmd) {
 	if m.svcIdx >= len(m.selectedServices) {
-		return m.enterSummary()
+		return m.enterPostSync()
 	}
 
 	m.svcName = m.selectedServices[m.svcIdx]
@@ -334,16 +715,20 @@ func (m WorkflowModel) startNextService() (tea.Model, tea.Cmd) {
 	m.buildArgQueue = nil
 	m.buildArgIdx = 0
 	m.oldTag = m.svc.LastTag
+	m.dockerBranchChoices = nil
+	m.dockerfileBranches = nil
 	m.newTag = ""
 	m.dockerfilePath = ""
 	m.discovered = false
 
 	SetStatus(m.svcName, m.cfg.Config.ECRRegion)
 
-	if len(m.selectedServices) > 1 {
-		m.log = append(m.log, "\n"+SectionStyle.Render(fmt.Sprintf(
-			"── Servizio [%d/%d]: %s", m.svcIdx+1, len(m.selectedServices), strings.ToUpper(m.svcName))))
-	}
+	// The service opens with its header straight away, so everything logged for
+	// it lands underneath — a missing Dockerfile included, which is resolved here
+	// before the tag is asked. The tag half is filled in once chosen: the view
+	// redraws the log every frame, so the line updates where it stands.
+	m.svcLogStart = len(m.log)
+	m.log = append(m.log, m.serviceHeader(), logInfo("Immagine", m.svc.ECRRepository+":"+m.oldTag))
 
 	// Tag sync (synchronous kubectl get — typically fast)
 	if !m.testUI && m.svc.ReleaseName != "" && m.svc.Namespace != "" && m.svc.HelmSetKey != "" {
@@ -382,6 +767,8 @@ func (m WorkflowModel) finishTagSync() (tea.Model, tea.Cmd) {
 		} else {
 			m.svc.LastTag = deployedTag
 			m.oldTag = deployedTag
+			m.log[m.svcLogStart] = m.serviceHeader()
+			m.log[m.svcLogStart+1] = logInfo("Immagine", m.svc.ECRRepository+":"+m.oldTag)
 			m.log = append(m.log, SuccessStyle.Render(fmt.Sprintf(`  ✓  last_tag aggiornato a %q`, deployedTag)))
 		}
 	}
@@ -392,65 +779,291 @@ func (m WorkflowModel) finishTagSync() (tea.Model, tea.Cmd) {
 
 func (m WorkflowModel) enterDockerfileResolve() (tea.Model, tea.Cmd) {
 	svc := m.svc
-	cfg := m.cfg
-	svcName := m.svcName
+	buildRoot := m.dockerBuildRoot()
 
 	if svc.DockerfileSubpath != "" {
-		full := filepath.Join(cfg.Config.DockerRootPath, svc.DockerfileSubpath)
+		full := filepath.Join(buildRoot, svc.DockerfileSubpath)
 		abs, err := filepath.Abs(full)
 		if err == nil {
 			if _, err := os.Stat(abs); err == nil {
 				m.dockerfilePath = abs
 				m.discovered = false
-				m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+abs))
+				m.log = append(m.log, logInfo("Dockerfile", shortPath(abs)))
 				return m.enterTagInput()
 			}
-			m.log = append(m.log, WarnStyle.Render("  ⚠  Dockerfile configurato non trovato: "+abs))
+			// A configured path that is missing usually means the repo is on a
+			// branch without this service, so scanning is the user's decision.
+			warn := []string{"Dockerfile configurato non trovato", shortPath(abs)}
+			if branch, err := logic.GitCurrentBranch(buildRoot); err == nil && branch != "" {
+				warn = append(warn, "branch del repo Docker: "+branch)
+			}
+			// Where the Dockerfile does exist, read from the refs the clone already
+			// has: the branch to move to is then on screen, not in memory.
+			choices, errChoices := logic.RemoteBranches(buildRoot)
+			found, errFound := logic.BranchesContaining(buildRoot, svc.DockerfileSubpath)
+			if errChoices == nil && errFound == nil && len(choices) > 0 {
+				m.dockerBranchChoices, m.dockerfileBranches = choices, found
+				warn = append(warn, wfBranchHint(found))
+			}
+			m.log = append(m.log, logWarn(warn...)...)
+			return m.enterDockerfileMissing()
 		}
 	}
 
-	searchRoot := cfg.Config.DockerRootPath
+	return m.enterDockerfileScan()
+}
+
+// enterDockerfileMissing asks what to do about a configured Dockerfile that is
+// not on disk. Cancelling comes first, so the safe answer is preselected.
+func (m WorkflowModel) enterDockerfileMissing() (tea.Model, tea.Cmd) {
+	items := []Item{{Value: "cancel", Label: "Annulla", Desc: "interrompe il deploy senza buildare"}}
+	if len(m.dockerBranchChoices) > 1 && m.canSwitchDockerBranch() {
+		items = append(items, Item{Value: "branch", Label: "Cambia branch",
+			Desc: "riallinea il repo Docker su un altro branch e riprova"})
+	}
+	items = append(items, Item{Value: "scan", Label: "Cerca un Dockerfile",
+		Desc: "l'immagine verrà pushata come " + m.svcName})
+
+	m.state = wfSvcDockerfileMissing
+	m.list = listModel{
+		title: "Dockerfile di " + m.svcName + " non trovato",
+		items: items,
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishDockerfileMissing() (tea.Model, tea.Cmd) {
+	switch m.list.selected {
+	case "scan":
+		return m.enterDockerfileScan()
+	case "branch":
+		return m.enterDockerBranchSwitchSelect()
+	}
+	m.log = append(m.log, ErrStyle.Render("  ✗  Deploy annullato: Dockerfile di "+m.svcName+" non trovato"))
+	m.cancelled = true
+	return m, tea.Quit
+}
+
+// ── Cambio del branch Docker a metà servizio ──────────────────────────────────
+
+// canSwitchDockerBranch reports whether the Docker branch can be changed from
+// the missing-Dockerfile question. hub-cli moves its own clone between branches,
+// never the working copy, which may hold work in progress — so --local-sources
+// never gets the option. In test-ui and dry-run nothing is checked out: the
+// switch is shown, not performed.
+func (m WorkflowModel) canSwitchDockerBranch() bool {
+	switch {
+	case m.localSources || m.cfg.Config.DockerRootPath == "":
+		return false
+	case m.testUI || m.dryRun:
+		return true
+	default:
+		return m.dockerRepoDir != "" && m.dockerURL != ""
+	}
+}
+
+// enterDockerBranchSwitchSelect offers the branches to move the Docker clone
+// to, the ones that have this Dockerfile first — so the first is preselected.
+func (m WorkflowModel) enterDockerBranchSwitchSelect() (tea.Model, tea.Cmd) {
+	current, _ := logic.GitCurrentBranch(m.dockerBuildRoot())
+	m.state = wfSvcDockerBranchSelect
+	m.list = listModel{
+		title: "Branch del repo Docker per " + m.svcName,
+		items: wfBranchChoices(m.dockerBranchChoices, m.dockerfileBranches, current),
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishDockerBranchSwitchSelect() (tea.Model, tea.Cmd) {
+	return m.enterDockerBranchSwitch(m.list.selected)
+}
+
+// enterDockerBranchSwitch moves the Docker clone to branch and retries the
+// Dockerfile. The move holds for the rest of the run — there is one clone, and
+// the services after this one build from wherever it is left — but it is not
+// saved as the next run's default: it answered one service, not the run.
+func (m WorkflowModel) enterDockerBranchSwitch(branch string) (tea.Model, tea.Cmd) {
+	m.switchBranch = branch
+	m.opStart = time.Now()
+
+	if m.dryRun {
+		m.log = append(m.log, wfDryRunLine("git checkout "+branch+" nel repo Docker gestito"))
+		return m.handleDockerSwitchDone(wfDockerSwitchDoneMsg{})
+	}
+
+	m.state = wfSvcDockerBranchSwitch
+	m.spinner = newSpinnerModel("Repo Docker su " + branch)
+	if m.testUI {
+		return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+			time.Sleep(900 * time.Millisecond)
+			return wfDockerSwitchDoneMsg{}
+		})
+	}
+
+	remoteURL, reposRoot := m.dockerURL, config.GetReposRoot()
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		dir, err := logic.EnsureRepo(remoteURL, branch, reposRoot, nil)
+		return wfDockerSwitchDoneMsg{dir: dir, err: err}
+	})
+}
+
+// handleDockerSwitchDone retries the Dockerfile on the branch just checked out.
+// A failed move goes back to the question, so another branch can be tried.
+func (m WorkflowModel) handleDockerSwitchDone(msg wfDockerSwitchDoneMsg) (tea.Model, tea.Cmd) {
+	elapsed := formatElapsed(time.Since(m.opStart))
+	if msg.err != nil {
+		m.log = append(m.log, logFailure("Repo Docker", msg.err, elapsed)...)
+		return m.enterDockerfileMissing()
+	}
+	m.dockerBranch = m.switchBranch
+
+	if m.testUI || m.dryRun {
+		// Nothing was checked out: the Dockerfile is taken as found, the way a
+		// simulated run takes every other step as done.
+		if m.dryRun {
+			elapsed = ""
+		}
+		m.log = append(m.log, logDone("Repo Docker", "origin/"+m.switchBranch+" · simulato", elapsed))
+		m.dockerfilePath = filepath.Join(m.dockerBuildRoot(), m.svc.DockerfileSubpath)
+		m.discovered = false
+		m.log = append(m.log, logInfo("Dockerfile", shortPath(m.dockerfilePath)))
+		return m.enterTagInput()
+	}
+
+	m.dockerRepoDir = msg.dir
+	m.log = append(m.log, logDone("Repo Docker", "origin/"+m.switchBranch, elapsed))
+	return m.enterDockerfileResolve()
+}
+
+// wfBranchChoices lists where the Docker clone can move: the branches with this
+// Dockerfile first, then the others. The branch in use is left out — it is the
+// one that just turned out not to have it.
+func wfBranchChoices(all, containing []string, current string) []Item {
+	has := make(map[string]bool, len(containing))
+	var items []Item
+	for _, b := range containing {
+		if b == current {
+			continue
+		}
+		has[b] = true
+		items = append(items, Item{Value: b, Label: b, Desc: "contiene il Dockerfile"})
+	}
+	for _, b := range all {
+		if b != current && !has[b] {
+			items = append(items, Item{Value: b, Label: b})
+		}
+	}
+	return items
+}
+
+// wfBranchHint says where the missing Dockerfile does exist, so the branch to
+// move to is read off the warning instead of remembered.
+func wfBranchHint(found []string) string {
+	const shown = 3
+	switch {
+	case len(found) == 0:
+		return "non presente in nessun branch di origin"
+	case len(found) <= shown:
+		return "presente su: " + strings.Join(found, ", ")
+	default:
+		return fmt.Sprintf("presente su: %s e altri %d", strings.Join(found[:shown], ", "), len(found)-shown)
+	}
+}
+
+// wfBranchGroup is the share of a manifest sync that goes to one branch.
+type wfBranchGroup struct {
+	branch   string
+	services []deployedService
+}
+
+// wfByDockerBranch splits the manifest sync by the branch each image was built
+// from, in order of first appearance. A service that moved the Docker clone
+// mid-run carries its manifest back there; one with no branch recorded — a
+// simulated run — takes the run's.
+func wfByDockerBranch(deployed []deployedService, fallback string) []wfBranchGroup {
+	var groups []wfBranchGroup
+	index := map[string]int{}
+	for _, d := range deployed {
+		branch := d.dockerBranch
+		if branch == "" {
+			branch = fallback
+		}
+		i, ok := index[branch]
+		if !ok {
+			i = len(groups)
+			index[branch] = i
+			groups = append(groups, wfBranchGroup{branch: branch})
+		}
+		groups[i].services = append(groups[i].services, d)
+	}
+	return groups
+}
+
+// enterDockerfileScan discovers Dockerfiles under the Docker root. What it finds
+// is always offered for confirmation: the destination comes from the config
+// whatever is picked, so a wrong pick deploys the wrong image successfully.
+func (m WorkflowModel) enterDockerfileScan() (tea.Model, tea.Cmd) {
+	svcName := m.svcName
+	buildRoot := m.dockerBuildRoot()
+
+	searchRoot := buildRoot
 	if prefix := wfProjectPrefix(svcName); prefix != "" {
-		projectDir := filepath.Join(cfg.Config.DockerRootPath, prefix)
+		projectDir := filepath.Join(buildRoot, prefix)
 		if info, err := os.Stat(projectDir); err == nil && info.IsDir() {
 			searchRoot = projectDir
 		}
 	}
-	m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  Scansione Dockerfile in %s...", searchRoot)))
+	m.log = append(m.log, logInfo("Scansione", shortPath(searchRoot)))
 
 	files, err := logic.FindDockerfiles(searchRoot)
-	if err != nil || len(files) == 0 && searchRoot != cfg.Config.DockerRootPath {
-		files, _ = logic.FindDockerfiles(cfg.Config.DockerRootPath)
+	if err != nil || len(files) == 0 && searchRoot != buildRoot {
+		files, _ = logic.FindDockerfiles(buildRoot)
 	}
 
 	if len(files) == 0 {
-		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", cfg.Config.DockerRootPath)))
+		m.log = append(m.log, ErrStyle.Render(fmt.Sprintf("  ✗  Nessun Dockerfile trovato in %s", buildRoot)))
 		return m, tea.Quit
-	}
-	if len(files) == 1 {
-		m.dockerfilePath = files[0]
-		m.discovered = true
-		m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+files[0]))
-		return m.enterTagInput()
 	}
 	return m.enterDockerfileList(files)
 }
 
 func (m WorkflowModel) enterDockerfileList(files []string) (tea.Model, tea.Cmd) {
 	m.state = wfSvcDockerfile
-	items := make([]Item, len(files))
-	for i, f := range files {
-		items[i] = Item{Value: f, Label: f}
+	items := dockerfileItems(files, m.dockerBuildRoot())
+	m.list = listModel{
+		title: wfDockerfileListTitle(m.svcName, m.svc.ECRRepository),
+		items: items,
+		width: m.width,
 	}
-	m.list = listModel{title: "Seleziona Dockerfile", items: items, width: m.width}
 	return m, m.list.Init()
+}
+
+// wfDockerfileListTitle names the destination in the title: it comes from the
+// config whatever file is picked, so a mismatch is visible while choosing.
+func wfDockerfileListTitle(serviceName, ecrRepository string) string {
+	title := "Seleziona Dockerfile da buildare come " + serviceName
+	if ecrRepository != "" {
+		if idx := strings.Index(ecrRepository, "/"); idx != -1 {
+			title += " → " + ecrRepository[idx+1:]
+		}
+	}
+	return title
 }
 
 func (m WorkflowModel) finishDockerfile() (tea.Model, tea.Cmd) {
 	m.dockerfilePath = m.list.selected
 	m.discovered = true
-	m.log = append(m.log, DimStyle.Render("  ·  Dockerfile: "+m.dockerfilePath))
+	m.log = append(m.log, logInfo("Dockerfile", shortPath(m.dockerfilePath)))
 	return m.enterTagInput()
+}
+
+// shouldPersistDockerfilePath reports whether a discovered path is worth saving
+// back to the config. A service that already declares one keeps it: overwriting
+// would replace a correct value with one found on the wrong branch.
+func (m WorkflowModel) shouldPersistDockerfilePath() bool {
+	return m.discovered && m.svc.DockerfileSubpath == "" && !m.testUI
 }
 
 // ── Tag input ─────────────────────────────────────────────────────────────────
@@ -467,6 +1080,12 @@ func (m WorkflowModel) enterTagInput() (tea.Model, tea.Cmd) {
 	return m, m.input.Init()
 }
 
+// serviceHeader renders the header of the service in hand. Its tag half stays
+// pending until the tag is chosen.
+func (m WorkflowModel) serviceHeader() string {
+	return logServiceHeader(m.svcIdx+1, len(m.selectedServices), m.svcName, m.oldTag, m.newTag)
+}
+
 func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	val := m.input.textInput.Value()
 	if val == "" {
@@ -474,8 +1093,8 @@ func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 	}
 	m.newTag = val
 
-	if m.discovered && !m.testUI && m.cfg.Config.DockerRootPath != "" {
-		rel, relErr := filepath.Rel(m.cfg.Config.DockerRootPath, m.dockerfilePath)
+	if buildRoot := m.dockerBuildRoot(); m.shouldPersistDockerfilePath() && buildRoot != "" {
+		rel, relErr := filepath.Rel(buildRoot, m.dockerfilePath)
 		if relErr != nil {
 			rel = m.dockerfilePath
 		}
@@ -486,15 +1105,20 @@ func (m WorkflowModel) finishTagInput() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	content := fmt.Sprintf("  %s    %s  →  %s  ",
-		SelectedItemStyle.Render(m.svcName),
-		DimStyle.Render(m.oldTag),
-		SuccessStyle.Render(m.newTag),
-	)
-	m.log = append(m.log, "\n"+BoxStyle.Render(content))
+	m.log[m.svcLogStart] = m.serviceHeader()
+
+	// Same tag, same rendered manifest: Kubernetes sees no change and keeps the
+	// pod as it is, so the image just pushed never starts on its own. The warning
+	// goes right under the header it qualifies, ahead of whatever the Dockerfile
+	// resolution logged in the meantime.
+	if m.newTag == m.oldTag {
+		m.log = slices.Insert(m.log, m.svcLogStart+1, logWarn(
+			"Il manifest non cambia: il pod non riparte da solo.",
+			"A fine deploy hub-cli propone il riavvio.")...)
+	}
 
 	if dockerArgs, err := logic.ParseDockerfileArgs(m.dockerfilePath); err == nil && len(dockerArgs) > 0 {
-		m.log = append(m.log, DimStyle.Render(fmt.Sprintf("  ·  %d build ARG rilevati nel Dockerfile", len(dockerArgs))))
+		m.log = append(m.log, logInfo("Build ARG", fmt.Sprintf("%d rilevati nel Dockerfile", len(dockerArgs))))
 		m.buildArgQueue = dockerArgs
 		m.buildArgIdx = 0
 		return m.enterBuildArg()
@@ -528,7 +1152,11 @@ func (m WorkflowModel) finishBuildArg() (tea.Model, tea.Cmd) {
 // ── Build ─────────────────────────────────────────────────────────────────────
 
 func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
-	m.valuesPath = filepath.Join(m.cfg.Config.HelmRootPath, m.svc.HelmValuesPath)
+	// A blank line between what the service is and what is being done to it:
+	// the facts above are context, everything below is the pipeline running.
+	m.log = append(m.log, "")
+
+	m.valuesPath = filepath.Join(m.helmValuesRoot(), m.svc.HelmValuesPath)
 	m.chartVersion = m.svc.ChartVersion
 	if m.chartVersion == "" {
 		m.chartVersion = m.cfg.Config.ChartVersion
@@ -549,6 +1177,17 @@ func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("docker push %s:%s", m.svc.ECRRepository, m.newTag)))
 		m.log = append(m.log, wfDryRunLine(fmt.Sprintf("helm upgrade %s %s -f %s --namespace %s --set %s --version %s",
 			m.svc.ReleaseName, m.svc.ChartName, m.valuesPath, m.svc.Namespace, m.helmSetArg, m.chartVersion)))
+		if m.newTag == m.oldTag {
+			// Same fallback as a real run: without a Deployment name there is no
+			// restart to preview, and inventing one from the values key would
+			// print a command that does not exist.
+			if name, err := m.resolveRestartTarget(); err == nil && name != "" {
+				m.log = append(m.log, wfDryRunLine(logic.RolloutRestartCommandLine(name, m.svc.Namespace)))
+			} else {
+				m.log = append(m.log, WarnStyle.Render(
+					"  ⚠  Tag invariato: il values non dichiara un nome di deployment, riavvio non possibile"))
+			}
+		}
 		m.log = append(m.log, "\n"+SecondaryStyle.Render(fmt.Sprintf(
 			"  ◆  DRY-RUN  —  %s  %s → %s  (non deployato)", m.svcName, m.oldTag, m.newTag)))
 		m.results = append(m.results, DeployResult{Service: m.svcName, OldTag: m.oldTag, NewTag: m.newTag, Skipped: true})
@@ -578,21 +1217,71 @@ func (m WorkflowModel) enterBuild() (tea.Model, tea.Cmd) {
 // ── Push ──────────────────────────────────────────────────────────────────────
 
 func (m WorkflowModel) enterPush() (tea.Model, tea.Cmd) {
+	return m.enterPushAttempt(1)
+}
+
+// enterPushAttempt runs one attempt of the push. A repeated one waits first, so
+// the registry is not asked again straight after refusing.
+func (m WorkflowModel) enterPushAttempt(attempt int) (tea.Model, tea.Cmd) {
 	m.state = wfSvcPushing
+	m.pushAttempt = attempt
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Docker Push")
+	m.spinner = newSpinnerModel(pushLabel("Docker Push", attempt))
 	svc := m.svc
 	newTag := m.newTag
 	testUI := m.testUI
+	refuse := testUI && refusesSimulatedPush(attempt, m.svcIdx, len(m.selectedServices))
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		if attempt > 1 {
+			time.Sleep(pushRetryDelay)
+		}
 		if testUI {
 			time.Sleep(1500 * time.Millisecond)
+			if refuse {
+				return wfOpDoneMsg{err: errSimulatedPush, output: []byte(simulatedECRTimeout)}
+			}
 			return wfOpDoneMsg{}
 		}
 		var buf bytes.Buffer
 		err := logic.DockerPush(svc.ECRRepository, newTag, &buf)
 		return wfOpDoneMsg{err: err, output: buf.Bytes()}
 	})
+}
+
+// ── Push error recovery ───────────────────────────────────────────────────────
+
+// enterPushError asks what to do once every attempt of the push has failed.
+// The services before this one are already on the cluster: skipping this one
+// carries the run on to the next service and to the sync, where leaving would
+// skip the sync as well.
+func (m WorkflowModel) enterPushError() (tea.Model, tea.Cmd) {
+	cancel := "esce senza deploy"
+	if len(m.deployed) > 0 {
+		cancel = "esce subito, senza il sync dei servizi già deployati"
+	}
+	othersLeft := len(m.deployed) > 0 || m.svcIdx+1 < len(m.selectedServices)
+
+	m.state = wfSvcPushError
+	m.list = listModel{
+		errorTone: true,
+		title:     "Push di " + m.svcName + " non riuscito",
+		items:     pushErrorItems(m.svcName, m.oldTag, othersLeft, cancel),
+		width:     m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishPushError() (tea.Model, tea.Cmd) {
+	switch m.list.selected {
+	case "retry":
+		return m.enterPush()
+	case "skip":
+		m.log = append(m.log, logPushSkipped(m.svcName, m.oldTag)...)
+		m.svcIdx++
+		return m.startNextService()
+	}
+	m.cancelled = true
+	return m, tea.Quit
 }
 
 // ── Helm ──────────────────────────────────────────────────────────────────────
@@ -622,11 +1311,12 @@ func (m WorkflowModel) enterHelm() (tea.Model, tea.Cmd) {
 func (m WorkflowModel) enterHelmError() (tea.Model, tea.Cmd) {
 	m.state = wfSvcHelmError
 	m.list = listModel{
-		title: "Cosa vuoi fare?",
+		errorTone: true,
+		title:     "Cosa vuoi fare?",
 		items: []Item{
-			{Value: "retry", Label: "Riprova — esegui 'helm repo update' poi riprova"},
-			{Value: "rollback", Label: "Rollback — rimuove l'immagine da ECR e annulla"},
-			{Value: "cancel", Label: "Annulla  — esce senza deploy (immagine resta su ECR)"},
+			{Value: "retry", Label: "Riprova", Desc: "esegue 'helm repo update' e riprova"},
+			{Value: "rollback", Label: "Rollback", Desc: "rimuove l'immagine da ECR e annulla"},
+			{Value: "cancel", Label: "Annulla", Desc: "esce senza deploy, l'immagine resta su ECR"},
 		},
 		width: m.width,
 	}
@@ -662,37 +1352,128 @@ func (m WorkflowModel) enterRollback() (tea.Model, tea.Cmd) {
 
 // ── Post-deploy sync ──────────────────────────────────────────────────────────
 
+// enterPostSync runs once, after every selected service has been deployed: one
+// commit for the whole run means fewer pushes and fewer races.
 func (m WorkflowModel) enterPostSync() (tea.Model, tea.Cmd) {
-	helmRoot := config.GetHelmRootPath()
-	dockerRoot := config.GetDockerRootPath()
-	hasHelm := helmRoot != "" && m.svc.HelmValuesPath != "" && m.svc.HelmSetKey != ""
-	hasDocker := dockerRoot != "" && m.svc.K8sManifestPath != "" && m.svc.K8sImageRef != ""
+	if len(m.deployed) == 0 {
+		return m.enterSummary()
+	}
+	if m.localSources {
+		// The cluster runs a values file that exists in no commit: the tag on
+		// the shared branch would describe an unreproducible state.
+		m.log = append(m.log, logWarn("Sync saltato: deploy di prova dalle copie di lavoro")...)
+		return m.enterSummary()
+	}
+	if m.dryRun || m.testUI {
+		if m.dryRun {
+			m.log = append(m.log, wfDryRunLine("aggiornamento values + commit e push sul repo gestito"))
+		}
+		return m.enterSummary()
+	}
 
-	if !hasHelm && !hasDocker {
+	m.state = wfPostSync
+	m.opStart = time.Now()
+	m.spinner = newSpinnerModel("Sync repo")
+	cfg := m.cfg
+	deployed := m.deployed
+	helmBranch := m.helmBranch
+	dockerBranch := m.dockerBranch
+	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
+		lines, err := wfRunPostDeploySync(cfg, deployed, helmBranch, dockerBranch)
+		return wfPostSyncDoneMsg{lines: lines, err: err}
+	})
+}
+
+// ── Restart a tag invariato ───────────────────────────────────────────────────
+
+// resolveRestartTarget reads the Deployment name out of the values block this
+// service deploys to. The name is not the values key and not the service name:
+// the templates take it from `name` inside the block, so anything else is a
+// guess that would restart the wrong Deployment — or none.
+func (m WorkflowModel) resolveRestartTarget() (string, error) {
+	if m.valuesPath == "" || m.svc.HelmSetKey == "" {
+		return "", nil
+	}
+	values, err := logic.ReadHelmValues(m.valuesPath)
+	if err != nil {
+		return "", err
+	}
+	return values.DeploymentFor(m.svc.HelmSetKey), nil
+}
+
+// enterRestartPrompt asks before restarting a service redeployed under the same
+// tag: helm rendered an identical manifest, so the pod is still running the
+// previous image. The default rolling update starts the new pod before stopping
+// the old one, so the two overlap briefly — worth saying out loud rather than
+// doing silently.
+func (m WorkflowModel) enterRestartPrompt() (tea.Model, tea.Cmd) {
+	if m.newTag != m.oldTag || m.svc.Namespace == "" {
 		return m.finishService()
 	}
 
-	m.state = wfSvcPostSync
+	target, err := m.resolveRestartTarget()
+	if err != nil || target == "" {
+		reason := "il values non dichiara un nome di deployment"
+		if err != nil {
+			reason = err.Error()
+		}
+		m.log = append(m.log, WarnStyle.Render("  ⚠  Tag invariato ma riavvio non possibile: "+reason))
+		return m.finishService()
+	}
+	m.restartTarget = target
+
+	m.state = wfSvcRestartConfirm
+	m.list = listModel{
+		title: "Tag invariato per " + target + " — riavviare?",
+		items: []Item{
+			{Value: "restart", Label: "Riavvia",
+				Desc: "rollout restart; per qualche decina di secondi girano due istanze"},
+			{Value: "skip", Label: "Salta", Desc: "il pod continua a girare l'immagine precedente"},
+		},
+		width: m.width,
+	}
+	return m, m.list.Init()
+}
+
+func (m WorkflowModel) finishRestartPrompt() (tea.Model, tea.Cmd) {
+	if m.list.selected != "restart" {
+		m.log = append(m.log, WarnStyle.Render(
+			"  ⚠  Riavvio saltato: "+m.restartTarget+" gira ancora l'immagine precedente"))
+		return m.finishService()
+	}
+
+	m.state = wfSvcRestarting
 	m.opStart = time.Now()
-	m.spinner = newSpinnerModel("Aggiornamento repo")
-	cfg := m.cfg
-	svc := m.svc
-	svcName := m.svcName
-	newTag := m.newTag
-	valuesPath := m.valuesPath
+	m.spinner = newSpinnerModel("Rollout restart di " + m.restartTarget)
+
+	target, namespace, testUI := m.restartTarget, m.svc.Namespace, m.testUI
 	return m, tea.Batch(m.spinner.Init(), func() tea.Msg {
-		lines := wfRunPostDeploySync(cfg, svc, svcName, newTag, valuesPath)
-		return wfPostSyncDoneMsg{lines: lines}
+		if testUI {
+			time.Sleep(1500 * time.Millisecond)
+			return wfOpDoneMsg{}
+		}
+		var buf bytes.Buffer
+		err := logic.RestartDeployments([]string{target}, namespace, &buf)
+		return wfOpDoneMsg{err: err, output: buf.Bytes()}
 	})
+}
+
+// markRestarted records that the service in hand was redeployed under the same
+// tag and had its pod recreated. Its result is appended by finishService right
+// after, so the flag is carried on the model until then.
+func (m *WorkflowModel) markRestarted() {
+	m.restarted = true
 }
 
 func (m WorkflowModel) finishService() (tea.Model, tea.Cmd) {
 	m.results = append(m.results, DeployResult{
-		Service: m.svcName,
-		OldTag:  m.oldTag,
-		NewTag:  m.newTag,
-		Elapsed: time.Since(m.svcStart),
+		Service:   m.svcName,
+		OldTag:    m.oldTag,
+		NewTag:    m.newTag,
+		Elapsed:   time.Since(m.svcStart),
+		Restarted: m.restarted,
 	})
+	m.restarted = false
 	m.svcIdx++
 	return m.startNextService()
 }
@@ -713,17 +1494,24 @@ func (m WorkflowModel) View() tea.View {
 		sb.WriteString(line + "\n")
 	}
 	switch m.state {
-	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcPostSync:
-		elapsed := DimStyle.Render(formatElapsed(time.Since(m.opStart)))
-		sb.WriteString(fmt.Sprintf("  %s  %s\n", m.spinnerFrame(), elapsed))
+	case wfECRLogin, wfSvcBuilding, wfSvcPushing, wfSvcHelm, wfSvcRollback, wfSvcRestarting, wfSvcDockerBranchSwitch,
+		wfBranchLoading, wfRepoPrep, wfDockerBranchLoading, wfDockerRepoPrep, wfPostSync:
+		// A run stopped mid-step quits in that step's state: the final frame
+		// must not show it as still running under the error that ended it.
+		if !m.cancelled {
+			sb.WriteString(logRunning(m.spinnerFrame(), m.spinner.label,
+				formatElapsed(time.Since(m.opStart))) + "\n")
+		}
+	// A question stands off the log it interrupts, instead of continuing it.
 	case wfServiceSelect:
-		sb.WriteString(m.multisel.View().Content)
+		sb.WriteString("\n" + m.multisel.View().Content)
 	case wfSvcTagSync:
-		sb.WriteString(m.confirm.View().Content)
-	case wfSvcDockerfile, wfSvcHelmError:
-		sb.WriteString(m.list.View().Content)
+		sb.WriteString("\n" + m.confirm.View().Content)
+	case wfBranchSelect, wfDockerBranchSelect, wfSvcDockerfile, wfSvcDockerfileMissing, wfSvcDockerBranchSelect, wfSvcPushError,
+		wfSvcHelmError, wfSvcRestartConfirm:
+		sb.WriteString("\n" + m.list.View().Content)
 	case wfSvcTagInput, wfSvcBuildArg:
-		sb.WriteString(m.input.View().Content)
+		sb.WriteString("\n" + m.input.View().Content)
 	case wfSummary:
 		w := m.width
 		if w == 0 {
@@ -739,59 +1527,53 @@ func (m WorkflowModel) View() tea.View {
 // ── Step tracker (tab bar) ────────────────────────────────────────────────────
 
 func (m WorkflowModel) renderStepTracker() string {
-	var sb strings.Builder
-	sb.WriteString("\n")
+	frame := m.spinnerFrame()
+	inPipeline := m.state >= wfSvcTagSync && m.state < wfPostSync
 
-	// Tab ECR Login
-	var ecrTab string
+	tabs := []string{}
 	if m.state == wfECRLogin {
-		ecrTab = m.spinnerFrame() + " " + ValueStyle.Render("ECR")
+		tabs = append(tabs, trackerTab(trackSpinning, "ECR", frame))
 	} else {
-		ecrTab = SuccessStyle.Render("✓ ECR")
+		tabs = append(tabs, trackerTab(trackDone, "ECR", frame))
 	}
 
-	// Tab Selezione Servizi
-	var svcTab string
 	switch {
 	case m.state < wfServiceSelect:
-		svcTab = DimStyle.Render("· Servizi")
+		tabs = append(tabs, trackerTab(trackPending, "Servizi", frame))
 	case m.state == wfServiceSelect:
-		svcTab = CursorStyle.Render("▸") + " " + ValueStyle.Render("Servizi")
+		tabs = append(tabs, trackerTab(trackInteractive, "Servizi", frame))
 	default:
-		svcTab = SuccessStyle.Render("✓ Servizi")
+		tabs = append(tabs, trackerTab(trackDone, "Servizi", frame))
 	}
 
-	// Tab Pipeline
-	inPipeline := m.state >= wfSvcTagSync
-	var pipeTab string
-	if !inPipeline {
-		pipeTab = DimStyle.Render("· Pipeline")
-	} else {
-		total := len(m.selectedServices)
-		cur := m.svcIdx + 1
-		if cur > total {
-			cur = total
-		}
-		pipeTab = CursorStyle.Render("▸") + "  " +
-			ValueStyle.Render(fmt.Sprintf("Pipeline [%d/%d]", cur, total)) +
-			"  " + SelectedItemStyle.Render(strings.ToUpper(m.svcName))
+	pipeline := fmt.Sprintf("Pipeline [%d/%d]", min(m.svcIdx+1, len(m.selectedServices)), len(m.selectedServices))
+	switch {
+	case m.state < wfSvcTagSync:
+		tabs = append(tabs, trackerTab(trackPending, "Pipeline", frame))
+	case inPipeline:
+		tabs = append(tabs, trackerTab(trackInteractive, pipeline, frame))
+	default:
+		tabs = append(tabs, trackerTab(trackDone, pipeline, frame))
 	}
 
-	div := DimStyle.Render("   │   ")
-	sb.WriteString("  " + ecrTab + div + svcTab + div + pipeTab + "\n")
-
-	// Separatore orizzontale
-	w := m.width
-	if w == 0 {
-		w = 80
+	// The sync is one commit for the whole run, so it belongs to this row and
+	// not to the per-service one below.
+	switch {
+	case m.state >= wfSummary:
+		tabs = append(tabs, trackerTab(trackDone, "Sync", frame))
+	case m.state == wfPostSync:
+		tabs = append(tabs, trackerTab(trackSpinning, "Sync", frame))
+	default:
+		tabs = append(tabs, trackerTab(trackPending, "Sync", frame))
 	}
-	sb.WriteString(DimStyle.Render("  "+strings.Repeat("─", w-4)) + "\n")
 
-	// Sub-stages (solo in pipeline)
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(trackerRow(tabs) + "\n")
+	sb.WriteString(trackerRule(m.width) + "\n")
 	if inPipeline {
-		sb.WriteString("    " + m.renderPipelineStages() + "\n")
+		sb.WriteString(m.renderPipelineStages() + "\n")
 	}
-
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -800,95 +1582,52 @@ func (m WorkflowModel) spinnerFrame() string {
 	return m.spinner.spinner.View()
 }
 
+// renderPipelineStages is the row of the service being deployed. Deploy stays
+// here, unlike PSN: the local workflow upgrades one release per service.
 func (m WorkflowModel) renderPipelineStages() string {
-	type stStatus int
-	const (
-		stPending stStatus = iota
-		stInteractive
-		stSpinning
-		stFailed
-		stDone
-	)
-
-	asyncStatus := func(activeAt, doneAt wfState) stStatus {
-		if m.state >= doneAt {
-			return stDone
-		}
-		if m.state == activeAt {
-			return stSpinning
-		}
-		return stPending
-	}
-
-	configStatus := func() stStatus {
-		if m.state >= wfSvcBuilding {
-			return stDone
-		}
-		switch m.state {
-		case wfSvcTagSync, wfSvcDockerfile, wfSvcTagInput, wfSvcBuildArg:
-			return stInteractive
-		}
-		return stPending
-	}
-
-	deployStatus := func() stStatus {
-		if m.state >= wfSvcPostSync {
-			return stDone
-		}
-		if m.state == wfSvcHelm || m.state == wfSvcRollback {
-			return stSpinning
-		}
-		if m.state == wfSvcHelmError {
-			return stFailed
-		}
-		return stPending
-	}
-
-	type stageEntry struct {
-		label  string
-		status stStatus
-	}
-	stages := []stageEntry{
-		{"Config", configStatus()},
-		{"Build", asyncStatus(wfSvcBuilding, wfSvcPushing)},
-		{"Push", asyncStatus(wfSvcPushing, wfSvcHelm)},
-		{"Deploy", deployStatus()},
-		{"Sync", asyncStatus(wfSvcPostSync, wfSummary)},
-	}
-
 	frame := m.spinnerFrame()
-	var parts []string
-	for _, s := range stages {
-		var indicator, lbl string
-		switch s.status {
-		case stDone:
-			indicator = SuccessStyle.Render("✓")
-			lbl = DimStyle.Render(s.label)
-		case stSpinning:
-			indicator = frame
-			lbl = ValueStyle.Render(s.label)
-		case stInteractive:
-			indicator = CursorStyle.Render("▸")
-			lbl = ValueStyle.Render(s.label)
-		case stFailed:
-			indicator = ErrStyle.Render("✗")
-			lbl = ErrStyle.Render(s.label)
-		default:
-			indicator = DimStyle.Render("·")
-			lbl = DimStyle.Render(s.label)
-		}
-		parts = append(parts, indicator+" "+lbl)
+
+	config := trackPending
+	switch {
+	case m.state >= wfSvcBuilding:
+		config = trackDone
+	case m.state >= wfSvcTagSync:
+		config = trackInteractive
 	}
 
-	sep := DimStyle.Render("  →  ")
-	var out strings.Builder
-	for i, p := range parts {
-		if i > 0 {
-			out.WriteString(sep)
+	async := func(activeAt, doneAt wfState) trackerState {
+		switch {
+		case m.state >= doneAt:
+			return trackDone
+		case m.state == activeAt:
+			return trackSpinning
 		}
-		out.WriteString(p)
+		return trackPending
 	}
-	return out.String()
+
+	deploy := trackPending
+	switch {
+	case m.state >= wfPostSync:
+		deploy = trackDone
+	case m.state == wfSvcHelmError:
+		deploy = trackFailed
+	case m.state == wfSvcRestartConfirm:
+		deploy = trackInteractive
+	case m.state == wfSvcHelm || m.state == wfSvcRollback || m.state == wfSvcRestarting:
+		deploy = trackSpinning
+	}
+
+	push := async(wfSvcPushing, wfSvcHelm)
+	if m.state == wfSvcPushError {
+		push = trackFailed
+	}
+
+	return stageRow(m.svcName, []string{
+		trackerTab(config, "Config", frame),
+		trackerTab(async(wfSvcBuilding, wfSvcPushing), "Build", frame),
+		trackerTab(push, "Push", frame),
+		trackerTab(deploy, "Deploy", frame),
+	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -913,46 +1652,120 @@ func wfSortedServiceKeys(m map[string]config.ServiceConfig) []string {
 	return keys
 }
 
-func wfRunPostDeploySync(cfg *config.Config, svc config.ServiceConfig, serviceName, newTag, valuesPath string) []string {
+// wfRunPostDeploySync writes the deployed tags back to the repositories, one
+// commit per repository. A failure is reported, never swallowed: the branch
+// everybody deploys from would no longer match the cluster.
+func wfRunPostDeploySync(cfg *config.Config, deployed []deployedService, helmBranch, dockerBranch string) ([]string, error) {
 	var lines []string
-	helmRoot := config.GetHelmRootPath()
-	dockerRoot := config.GetDockerRootPath()
-	commitMsg := logic.DeployCommitMessage(serviceName, newTag)
+	var failures []error
 
-	if helmRoot != "" && svc.HelmValuesPath != "" && svc.HelmSetKey != "" {
-		if err := logic.UpdateHelmValuesTag(valuesPath, svc.HelmSetKey, newTag, svc.HelmImagePath); err != nil {
-			lines = append(lines, WarnStyle.Render("  ⚠  helm values non aggiornato: "+err.Error()))
-		} else {
-			lines = append(lines, SuccessStyle.Render("  ✓  Helm values aggiornato ("+svc.HelmValuesPath+")"))
-			if err := logic.GitAdd(helmRoot, svc.HelmValuesPath); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git add helm: "+err.Error()))
-			} else if err := logic.GitCommit(helmRoot, commitMsg); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git commit helm: "+err.Error()))
-			} else if err := logic.GitPush(helmRoot); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git push helm: "+err.Error()))
-			} else {
-				lines = append(lines, SuccessStyle.Render("  ✓  Helm repo: commit e push completati."))
+	message := logic.DeployCommitMessageFor(wfDeployedServices(deployed))
+	reposRoot := config.GetReposRoot()
+
+	if targets := wfHelmTargets(deployed); len(targets) > 0 && cfg.Config.HelmRootPath != "" {
+		ls, err := wfSyncRepo(
+			cfg.Config.HelmRootPath, helmBranch, reposRoot, message, "chart",
+			func(dir string) ([]string, error) {
+				var changed []string
+				for _, d := range targets {
+					path := filepath.Join(dir, d.svc.HelmValuesPath)
+					if err := logic.UpdateHelmValuesTag(path, d.svc.HelmSetKey, d.tag, d.svc.HelmImagePath); err != nil {
+						return nil, fmt.Errorf("%s: %w", d.name, err)
+					}
+					changed = append(changed, d.svc.HelmValuesPath)
+				}
+				return wfUnique(changed), nil
+			})
+		lines = append(lines, ls...)
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	// A service can have moved the Docker clone to another branch mid-run: each
+	// manifest goes back to the branch its image was built from, one commit per
+	// branch.
+	if targets := wfManifestTargets(deployed); len(targets) > 0 && cfg.Config.DockerRootPath != "" {
+		for _, group := range wfByDockerBranch(targets, dockerBranch) {
+			services := group.services
+			ls, err := wfSyncRepo(
+				cfg.Config.DockerRootPath, group.branch, reposRoot,
+				logic.DeployCommitMessageFor(wfDeployedServices(services)), "manifest k8s",
+				func(dir string) ([]string, error) {
+					var changed []string
+					for _, d := range services {
+						path := filepath.Join(dir, d.svc.K8sManifestPath)
+						if err := logic.UpdateK8sManifestImage(path, d.svc.K8sImageRef, d.tag); err != nil {
+							return nil, fmt.Errorf("%s: %w", d.name, err)
+						}
+						changed = append(changed, d.svc.K8sManifestPath)
+					}
+					return wfUnique(changed), nil
+				})
+			lines = append(lines, ls...)
+			if err != nil {
+				failures = append(failures, err)
 			}
 		}
 	}
 
-	if dockerRoot != "" && svc.K8sManifestPath != "" && svc.K8sImageRef != "" {
-		manifestAbs := filepath.Join(dockerRoot, svc.K8sManifestPath)
-		if err := logic.UpdateK8sManifestImage(manifestAbs, svc.K8sImageRef, newTag); err != nil {
-			lines = append(lines, WarnStyle.Render("  ⚠  k8s manifest non aggiornato: "+err.Error()))
-		} else {
-			lines = append(lines, SuccessStyle.Render("  ✓  K8s manifest aggiornato ("+svc.K8sManifestPath+")"))
-			if err := logic.GitAdd(dockerRoot, svc.K8sManifestPath); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git add docker: "+err.Error()))
-			} else if err := logic.GitCommit(dockerRoot, commitMsg); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git commit docker: "+err.Error()))
-			} else if err := logic.GitPush(dockerRoot); err != nil {
-				lines = append(lines, WarnStyle.Render("  ⚠  git push docker: "+err.Error()))
-			} else {
-				lines = append(lines, SuccessStyle.Render("  ✓  Docker repo: commit e push completati."))
-			}
-		}
+	return lines, errors.Join(failures...)
+}
+
+// wfSyncRepo pushes one repository's share of the deploy and logs the outcome.
+func wfSyncRepo(workingCopy, branch, reposRoot, message, label string,
+	apply func(dir string) ([]string, error)) ([]string, error) {
+
+	remoteURL, err := logic.GitRemoteURL(workingCopy)
+	if err != nil {
+		return logFailure("Sync "+label, err, ""), err
 	}
 
-	return lines
+	if err := logic.SyncToBranch(remoteURL, branch, reposRoot, message, apply, nil); err != nil {
+		lines := logFailure("Sync "+label, err, "")
+		return append(lines, logWarn("Il branch "+branch+" non riflette più lo stato del cluster.")...), err
+	}
+
+	return []string{logDone("Sync "+label, branch, "")}, nil
+}
+
+func wfDeployedServices(deployed []deployedService) []logic.DeployedService {
+	out := make([]logic.DeployedService, 0, len(deployed))
+	for _, d := range deployed {
+		out = append(out, logic.DeployedService{Name: d.name, Tag: d.tag})
+	}
+	return out
+}
+
+func wfHelmTargets(deployed []deployedService) []deployedService {
+	var out []deployedService
+	for _, d := range deployed {
+		if d.svc.HelmValuesPath != "" && d.svc.HelmSetKey != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func wfManifestTargets(deployed []deployedService) []deployedService {
+	var out []deployedService
+	for _, d := range deployed {
+		if d.svc.K8sManifestPath != "" && d.svc.K8sImageRef != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// wfUnique drops repeats: several services can share one values file.
+func wfUnique(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	var out []string
+	for _, p := range paths {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }

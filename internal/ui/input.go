@@ -58,7 +58,7 @@ func (m inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m inputModel) View() tea.View {
 	if m.done {
-		return tea.NewView(fmt.Sprintf("%s %s %s\n",
+		return tea.NewView(fmt.Sprintf("  %s %s %s\n",
 			LabelStyle.Render(m.title+":"),
 			CursorStyle.Render("▸"),
 			SelectedItemStyle.Render(m.textInput.Value()),
@@ -69,11 +69,11 @@ func (m inputModel) View() tea.View {
 		w = 80
 	}
 	bar := renderStatusBar(w)
-	content := fmt.Sprintf("%s\n%s\n%s",
-		TitleStyle.Render(m.title),
-		BoxStyle.Render(m.textInput.View()),
-		HelpStyle.Render("enter conferma · esc annulla"),
-	)
+	// Same shape as every other question: the title on the top edge of the frame,
+	// and the same two-column margin as the log around it.
+	content := questionBox(SelectedItemStyle.Render(m.title), CursorStyle,
+		[]string{m.textInput.View()}) +
+		"\n" + HelpStyle.Render("enter conferma · esc annulla")
 	if bar != "" {
 		content += "\n" + bar
 	}

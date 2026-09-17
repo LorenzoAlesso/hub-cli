@@ -62,7 +62,7 @@ func (m themePickerModel) View() tea.View {
 	if w == 0 {
 		w = 80
 	}
-	sb.WriteString(HelpStyle.Render("  ↑↓ naviga · enter seleziona · esc annulla"))
+	sb.WriteString(HelpStyle.Render("↑↓ naviga · enter seleziona · esc annulla"))
 	if bar := renderStatusBar(w); bar != "" {
 		sb.WriteString("\n" + bar)
 	}

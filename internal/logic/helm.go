@@ -48,3 +48,37 @@ func HelmUpgrade(releaseName, chartName, valuesPath, namespace, setArg, chartVer
 	}
 	return nil
 }
+
+// HelmDeployChart installs or upgrades a release from a chart directory, with one
+// --set per image being bumped: a single upgrade means one revision instead of
+// one per service. No --version is passed, the chart comes from the managed clone
+// and its version is whatever the branch declares.
+func HelmDeployChart(releaseName, chartDir, valuesPath, namespace string, setArgs []string, out io.Writer) error {
+	action := "upgrade"
+	if exec.Command("helm", "status", releaseName, "--namespace", namespace).Run() != nil {
+		action = "install"
+	}
+
+	args := []string{action, releaseName, chartDir, "-f", valuesPath, "--namespace", namespace}
+	for _, set := range setArgs {
+		args = append(args, "--set", set)
+	}
+
+	cmd := exec.Command("helm", args...)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("helm %s fallito: %w", action, err)
+	}
+	return nil
+}
+
+// HelmCommandLine renders the command HelmDeployChart would run, for --dry-run.
+func HelmCommandLine(releaseName, chartDir, valuesPath, namespace string, setArgs []string) string {
+	line := fmt.Sprintf("helm upgrade %s %s -f %s --namespace %s",
+		releaseName, chartDir, valuesPath, namespace)
+	for _, set := range setArgs {
+		line += " --set " + set
+	}
+	return line
+}

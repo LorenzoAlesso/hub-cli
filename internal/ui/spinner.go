@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/spinner"
@@ -28,9 +29,20 @@ type spinnerModel struct {
 	width   int
 }
 
+// gridDot is spinner.Dot without the trailing space its frames carry. On the
+// log grid the glyph takes one column, like ✓ and ⚠: with the space, a running
+// line — label and duration — sat one column right of the finished ones.
+var gridDot = func() spinner.Spinner {
+	frames := make([]string, len(spinner.Dot.Frames))
+	for i, f := range spinner.Dot.Frames {
+		frames[i] = strings.TrimSpace(f)
+	}
+	return spinner.Spinner{Frames: frames, FPS: spinner.Dot.FPS}
+}()
+
 func newSpinnerModel(label string) spinnerModel {
 	s := spinner.New()
-	s.Spinner = spinner.Dot
+	s.Spinner = gridDot
 	s.Style = CursorStyle
 	return spinnerModel{
 		spinner: s,
@@ -70,30 +82,21 @@ func (m spinnerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m spinnerModel) View() tea.View {
 	elapsed := formatElapsed(time.Since(m.start))
 
+	// A finished step lands on the same grid as the log inside the workflows:
+	// this spinner runs before the TUI, and its lines stay above it on screen.
 	if m.done {
 		if m.err != nil {
-			return tea.NewView(fmt.Sprintf("  %s  %s  %s\n",
-				ErrStyle.Render("✗"),
-				ValueStyle.Render(m.label),
-				DimStyle.Render(elapsed),
-			))
+			return tea.NewView(logFail(m.label, "", elapsed) + "\n")
 		}
-		return tea.NewView(fmt.Sprintf("  %s  %s  %s\n",
-			SuccessStyle.Render("✓"),
-			ValueStyle.Render(m.label),
-			DimStyle.Render(elapsed),
-		))
+		return tea.NewView(logDone(m.label, "", elapsed) + "\n")
 	}
 
 	w := m.width
 	if w == 0 {
 		w = 80
 	}
-	line := fmt.Sprintf("  %s  %s  %s",
-		m.spinner.View(),
-		ValueStyle.Render(m.label),
-		DimStyle.Render(elapsed),
-	)
+	// Running, the duration already sits where the finished line will put it.
+	line := logRunning(m.spinner.View(), m.label, elapsed)
 	if bar := renderStatusBar(w); bar != "" {
 		return tea.NewView(line + "\n" + bar)
 	}
@@ -107,7 +110,9 @@ func formatElapsed(d time.Duration) string {
 	}
 	m := int(d.Minutes())
 	s := int(d.Seconds()) % 60
-	return fmt.Sprintf("%dm %ds", m, s)
+	// Zero-padded: without it "1m 4s" and "2m 43s" never line up in the column
+	// the durations are read down.
+	return fmt.Sprintf("%dm %02ds", m, s)
 }
 
 // RunSpinner runs fn while showing an animated spinner with elapsed timer.
