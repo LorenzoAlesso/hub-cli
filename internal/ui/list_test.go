@@ -105,7 +105,7 @@ func TestLongListIsWindowed(t *testing.T) {
 	}
 }
 
-// Typing narrows the list, which is the only way 57 branches stay usable.
+// Typing narrows the list, which is the only way dozens of branches stay usable.
 func TestFilterNarrowsTheList(t *testing.T) {
 	m := listModel{items: []Item{
 		{Value: "a", Label: "site-a-pre-prod"},

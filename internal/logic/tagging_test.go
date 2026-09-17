@@ -4,7 +4,7 @@ import "testing"
 
 func TestIncrementPatch(t *testing.T) {
 	cases := map[string]string{
-		"3.0.9-dev":     "3.0.10-dev", // il tag della webapp su Site A collaudo
+		"3.0.9-dev":     "3.0.10-dev", // the patch gains a digit
 		"1.0.0-dev":     "1.0.1-dev",
 		"2.0.0":         "2.0.1",
 		"1.0.2-staging": "1.0.3-staging",

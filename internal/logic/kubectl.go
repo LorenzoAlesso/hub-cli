@@ -60,9 +60,10 @@ func KubectlUnsetCurrentContext() error {
 	return nil
 }
 
-// rolloutTimeout caps the wait for a restarted pod to become ready. JBoss takes
-// tens of seconds to boot, so the limit is generous: it exists to end the wait
-// on a pod that will never come up, not to time a normal restart.
+// rolloutTimeout caps the wait for a restarted pod to become ready. An
+// application server can take tens of seconds to boot, so the limit is
+// generous: it exists to end the wait on a pod that will never come up, not to
+// time a normal restart.
 const rolloutTimeout = 10 * time.Minute
 
 // RolloutRestart recreates the pods of a deployment. Redeploying an unchanged

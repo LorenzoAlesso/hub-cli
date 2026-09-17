@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// Shaped after app/values-site-a-coll.yaml: named image maps for the services,
+// Shaped like a site values file: named image maps for the services,
 // plus initContainer which carries a whole reference in a single string.
 const sampleValues = `namespace: app-coll
 
@@ -135,7 +135,7 @@ func TestHelmServiceWithInlineReference(t *testing.T) {
 	}
 }
 
-// The Site A values reference .../apps/initc twice, in both shapes: one service
+// A values file can reference .../apps/initc twice, in both shapes: one service
 // with two keys, so a new tag lands on both instead of leaving one behind.
 func TestSameImageReferencedTwice(t *testing.T) {
 	const values = `namespace: app-coll
@@ -264,7 +264,7 @@ func TestReadChartVersion(t *testing.T) {
 }
 
 // The Deployment name comes from `name` inside the block, not from the image and
-// not from the values key. On the app chart the three usually coincide, which is
+// not from the values key. On a typical chart the three coincide, which is
 // exactly why a restart that guessed would look right until it did not.
 const namedValues = `namespace: app-coll
 
