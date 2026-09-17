@@ -1336,7 +1336,7 @@ func (m PSNWorkflowModel) finishDeployError() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-// ── Restart dei servizi a tag invariato ───────────────────────────────────────
+// ── Restart of services with an unchanged tag ─────────────────────────────────
 
 // psnRestartTargets lists the Deployments that came out of the upgrade still
 // running the old image — those whose tag did not change, where helm rendered an
@@ -1412,7 +1412,7 @@ func (m PSNWorkflowModel) enterRestart() (tea.Model, tea.Cmd) {
 	})
 }
 
-// ── Sync: il tag torna nel values ─────────────────────────────────────────────
+// ── Sync: the tag goes back into the values ───────────────────────────────────
 
 // enterSync writes the deployed tags into the values file and pushes them. The
 // upgrade carried them as --set overrides only: without this the next
